@@ -99,7 +99,7 @@ class ReportViewSet(viewsets.ModelViewSet):
 
     def _get_sales_data(self, date_from, date_to):
         """Get sales data for the specified date range"""
-        from sales.models import Sale, Payment
+        from sales.models import Sale, Payment, SaleItem
         from django.db.models import Case, When, DecimalField
 
         sales = Sale.objects.filter(
@@ -135,6 +135,24 @@ class ReportViewSet(viewsets.ModelViewSet):
         for sale in sales:
             date_str = sale['date'].strftime('%Y-%m-%d')
             day_payments = payments_by_date.get(date_str, {})
+
+            # Calculate actual gross profit and cost of goods sold for the day
+            sales_items_for_day = SaleItem.objects.filter(
+                sale__sale_date__date=sale['date'],
+                sale__voided=False
+            ).select_related('product')
+
+            day_gross_profit = 0
+            day_cost_of_goods_sold = 0
+            for item in sales_items_for_day:
+                if item.product and item.product.cost_price:
+                    profit_per_item = (item.unit_price - item.product.cost_price) * item.quantity
+                    day_gross_profit += float(profit_per_item)
+                    day_cost_of_goods_sold += float(item.product.cost_price * item.quantity)
+
+            # Net profit (estimated as gross profit minus 5% operating costs)
+            day_net_profit = day_gross_profit * 0.95
+
             result.append({
                 'date': date_str,
                 'total_sales': float(sale['total_sales']),
@@ -142,8 +160,9 @@ class ReportViewSet(viewsets.ModelViewSet):
                 'card_sales': float(day_payments.get('card', 0)),
                 'mobile_sales': float(day_payments.get('mpesa', 0)),  # Frontend expects 'mobile_sales'
                 'transactions': sale['transaction_count'],  # Frontend expects 'transactions'
-                'gross_profit': float(sale['total_sales'] * Decimal('0.25')),  # Estimated 25% margin
-                'net_profit': float(sale['total_sales'] * Decimal('0.20'))  # Estimated 20% net profit
+                'gross_profit': day_gross_profit,
+                'net_profit': day_net_profit,
+                'cost_of_goods_sold': day_cost_of_goods_sold
             })
 
         return result
@@ -180,6 +199,23 @@ class ReportViewSet(viewsets.ModelViewSet):
                 'count': payment['count']
             }
 
+        # Calculate actual gross profit and cost of goods sold for the day
+        sales_items = SaleItem.objects.filter(
+            sale__sale_date__date=date,
+            sale__voided=False
+        ).select_related('product')
+
+        gross_profit = 0
+        cost_of_goods_sold = 0
+        for item in sales_items:
+            if item.product and item.product.cost_price:
+                profit_per_item = (item.unit_price - item.product.cost_price) * item.quantity
+                gross_profit += float(profit_per_item)
+                cost_of_goods_sold += float(item.product.cost_price * item.quantity)
+
+        # Net profit (estimated as gross profit minus 5% operating costs)
+        net_profit = gross_profit * 0.95
+
         # Top products sold today
         top_products = SaleItem.objects.filter(
             sale__sale_date__date=date
@@ -206,6 +242,9 @@ class ReportViewSet(viewsets.ModelViewSet):
             'total_sales': float(total_sales['total_amount'] or 0),
             'total_transactions': total_sales['transaction_count'] or 0,
             'average_transaction': float(total_sales['total_amount'] or 0) / max(total_sales['transaction_count'] or 1, 1),
+            'gross_profit': gross_profit,
+            'net_profit': net_profit,
+            'cost_of_goods_sold': cost_of_goods_sold,
             'payment_methods': payment_breakdown,
             'top_products': [
                 {
@@ -269,7 +308,7 @@ class ReportViewSet(viewsets.ModelViewSet):
                 'stock_level': product.stock_quantity,
                 'sold_today': sold_today,
                 'received_today': received_today,
-                'value': float(product.stock_quantity * product.cost_price),
+                'value': float(product.stock_quantity * product.selling_price),
             })
 
         return result
@@ -319,8 +358,8 @@ class ReportViewSet(viewsets.ModelViewSet):
 
         gross_profit = total_revenue - cost_of_goods_sold
 
-        # Estimated operating expenses (25% of revenue)
-        operating_expenses = total_revenue * 0.25
+        # Estimated operating expenses (5% of gross profit)
+        operating_expenses = gross_profit * 0.05
 
         net_profit = gross_profit - operating_expenses
         profit_margin = (net_profit / total_revenue) * 100 if total_revenue > 0 else 0
@@ -817,8 +856,21 @@ class SalesSummaryView(generics.GenericAPIView):
             sale_date__date=today
         ).count()
 
-        # Today's profit (estimated)
-        today_profit = float(today_sales) * 0.20  # 20% estimated profit margin
+        # Today's actual profit calculation
+        from sales.models import SaleItem
+        sales_items_today = SaleItem.objects.filter(
+            sale__sale_date__date=today,
+            sale__voided=False
+        ).select_related('product')
+
+        today_profit = 0
+        for item in sales_items_today:
+            if item.product and item.product.cost_price:
+                profit_per_item = (item.unit_price - item.product.cost_price) * item.quantity
+                today_profit += float(profit_per_item)
+
+        # Apply 5% operating cost deduction for net profit
+        today_profit = today_profit * 0.95
 
         # Products sold today
         products_today = self._get_products_sold_today(today)
@@ -935,6 +987,149 @@ class SalesSummaryView(generics.GenericAPIView):
                 'net_profit': day_net_profit,
                 'cost_of_goods_sold': day_cost_of_goods_sold
             })
+
+        return result
+
+    def _get_product_performance(self, date_from, date_to):
+        """Get product performance report for the specified date range"""
+        from sales.models import SaleItem, Sale
+        from django.db.models import Sum, Case, When, DecimalField
+
+        # Get all products sold in the date range with their performance metrics
+        # Separate retail and wholesale sales (exclude voided sales)
+        product_performance = SaleItem.objects.filter(
+            sale__sale_date__date__range=[date_from, date_to],
+            sale__voided=False
+        ).select_related('product', 'sale').values(
+            'product__name',
+            'product__sku',
+            'product__cost_price',
+            'product__selling_price',
+            'product__wholesale_price'
+        ).annotate(
+            # Total quantity sold
+            quantity_sold=Sum('quantity'),
+
+            # Retail sales (sale_type='retail')
+            retail_quantity=Sum(
+                Case(
+                    When(sale__sale_type='retail', then='quantity'),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            ),
+            retail_revenue=Sum(
+                Case(
+                    When(sale__sale_type='retail', then=F('unit_price') * F('quantity')),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            ),
+
+            # Wholesale sales (sale_type='wholesale')
+            wholesale_quantity=Sum(
+                Case(
+                    When(sale__sale_type='wholesale', then='quantity'),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            ),
+            wholesale_revenue=Sum(
+                Case(
+                    When(sale__sale_type='wholesale', then=F('unit_price') * F('quantity')),
+                    default=0,
+                    output_field=DecimalField()
+                )
+            ),
+
+            # Total revenue (retail + wholesale)
+            total_revenue=Sum(F('unit_price') * F('quantity')),
+
+            # Total cost (based on cost_price for all sales)
+            total_cost=Sum(F('product__cost_price') * F('quantity'))
+        ).order_by('-quantity_sold')
+
+        result = []
+        total_retail_quantity = 0
+        total_wholesale_quantity = 0
+        total_quantity = 0
+        total_retail_revenue = 0
+        total_wholesale_revenue = 0
+        total_revenue = 0
+        total_cost = 0
+        total_retail_profit = 0
+        total_wholesale_profit = 0
+        total_profit = 0
+
+        for item in product_performance:
+            cost_price = float(item['product__cost_price'] or 0)
+            retail_price = float(item['product__selling_price'] or 0)
+            wholesale_price = float(item['product__wholesale_price'] or 0)
+
+            # Quantities
+            retail_quantity = float(item['retail_quantity'] or 0)
+            wholesale_quantity = float(item['wholesale_quantity'] or 0)
+            total_quantity_sold = float(item['quantity_sold'] or 0)
+
+            # Revenues
+            retail_revenue = float(item['retail_revenue'] or 0)
+            wholesale_revenue = float(item['wholesale_revenue'] or 0)
+            total_revenue_item = float(item['total_revenue'] or 0)
+
+            # Costs and profits
+            total_cost_item = float(item['total_cost'] or 0)
+            retail_profit = retail_revenue - (cost_price * retail_quantity)
+            wholesale_profit = wholesale_revenue - (cost_price * wholesale_quantity)
+            total_profit_item = total_revenue_item - total_cost_item
+
+            result.append({
+                'product_name': item['product__name'],
+                'sku': item['product__sku'],
+                'buying_price': cost_price,
+                'retail_price': retail_price,
+                'wholesale_price': wholesale_price,
+                'retail_quantity': retail_quantity,
+                'wholesale_quantity': wholesale_quantity,
+                'total_quantity': total_quantity_sold,
+                'retail_revenue': retail_revenue,
+                'wholesale_revenue': wholesale_revenue,
+                'total_revenue': total_revenue_item,
+                'total_cost': total_cost_item,
+                'retail_profit': retail_profit,
+                'wholesale_profit': wholesale_profit,
+                'total_profit': total_profit_item
+            })
+
+            # Accumulate totals
+            total_retail_quantity += retail_quantity
+            total_wholesale_quantity += wholesale_quantity
+            total_quantity += total_quantity_sold
+            total_retail_revenue += retail_revenue
+            total_wholesale_revenue += wholesale_revenue
+            total_revenue += total_revenue_item
+            total_cost += total_cost_item
+            total_retail_profit += retail_profit
+            total_wholesale_profit += wholesale_profit
+            total_profit += total_profit_item
+
+        # Add totals at the bottom
+        result.append({
+            'product_name': 'TOTAL',
+            'sku': '',
+            'buying_price': 0.0,
+            'retail_price': 0.0,
+            'wholesale_price': 0.0,
+            'retail_quantity': total_retail_quantity,
+            'wholesale_quantity': total_wholesale_quantity,
+            'total_quantity': total_quantity,
+            'retail_revenue': total_retail_revenue,
+            'wholesale_revenue': total_wholesale_revenue,
+            'total_revenue': total_revenue,
+            'total_cost': total_cost,
+            'retail_profit': total_retail_profit,
+            'wholesale_profit': total_wholesale_profit,
+            'total_profit': total_profit
+        })
 
         return result
 
@@ -1288,148 +1483,6 @@ class ProductPriceListPDFView(generics.GenericAPIView):
 
         return result
 
-    def _get_product_performance(self, date_from, date_to):
-        """Get product performance report for the specified date range"""
-        from sales.models import SaleItem, Sale
-        from django.db.models import Sum, Case, When, DecimalField
-
-        # Get all products sold in the date range with their performance metrics
-        # Separate retail and wholesale sales (exclude voided sales)
-        product_performance = SaleItem.objects.filter(
-            sale__sale_date__date__range=[date_from, date_to],
-            sale__voided=False
-        ).select_related('product', 'sale').values(
-            'product__name',
-            'product__sku',
-            'product__cost_price',
-            'product__selling_price',
-            'product__wholesale_price'
-        ).annotate(
-            # Total quantity sold
-            quantity_sold=Sum('quantity'),
-
-            # Retail sales (sale_type='retail')
-            retail_quantity=Sum(
-                Case(
-                    When(sale__sale_type='retail', then='quantity'),
-                    default=0,
-                    output_field=DecimalField()
-                )
-            ),
-            retail_revenue=Sum(
-                Case(
-                    When(sale__sale_type='retail', then=F('unit_price') * F('quantity')),
-                    default=0,
-                    output_field=DecimalField()
-                )
-            ),
-
-            # Wholesale sales (sale_type='wholesale')
-            wholesale_quantity=Sum(
-                Case(
-                    When(sale__sale_type='wholesale', then='quantity'),
-                    default=0,
-                    output_field=DecimalField()
-                )
-            ),
-            wholesale_revenue=Sum(
-                Case(
-                    When(sale__sale_type='wholesale', then=F('unit_price') * F('quantity')),
-                    default=0,
-                    output_field=DecimalField()
-                )
-            ),
-
-            # Total revenue (retail + wholesale)
-            total_revenue=Sum(F('unit_price') * F('quantity')),
-
-            # Total cost (based on cost_price for all sales)
-            total_cost=Sum(F('product__cost_price') * F('quantity'))
-        ).order_by('-quantity_sold')
-
-        result = []
-        total_retail_quantity = 0
-        total_wholesale_quantity = 0
-        total_quantity = 0
-        total_retail_revenue = 0
-        total_wholesale_revenue = 0
-        total_revenue = 0
-        total_cost = 0
-        total_retail_profit = 0
-        total_wholesale_profit = 0
-        total_profit = 0
-
-        for item in product_performance:
-            cost_price = float(item['product__cost_price'] or 0)
-            retail_price = float(item['product__selling_price'] or 0)
-            wholesale_price = float(item['product__wholesale_price'] or 0)
-
-            # Quantities
-            retail_quantity = float(item['retail_quantity'] or 0)
-            wholesale_quantity = float(item['wholesale_quantity'] or 0)
-            total_quantity_sold = float(item['quantity_sold'] or 0)
-
-            # Revenues
-            retail_revenue = float(item['retail_revenue'] or 0)
-            wholesale_revenue = float(item['wholesale_revenue'] or 0)
-            total_revenue_item = float(item['total_revenue'] or 0)
-
-            # Costs and profits
-            total_cost_item = float(item['total_cost'] or 0)
-            retail_profit = retail_revenue - (cost_price * retail_quantity)
-            wholesale_profit = wholesale_revenue - (cost_price * wholesale_quantity)
-            total_profit_item = total_revenue_item - total_cost_item
-
-            result.append({
-                'product_name': item['product__name'],
-                'sku': item['product__sku'],
-                'buying_price': cost_price,
-                'retail_price': retail_price,
-                'wholesale_price': wholesale_price,
-                'retail_quantity': retail_quantity,
-                'wholesale_quantity': wholesale_quantity,
-                'total_quantity': total_quantity_sold,
-                'retail_revenue': retail_revenue,
-                'wholesale_revenue': wholesale_revenue,
-                'total_revenue': total_revenue_item,
-                'total_cost': total_cost_item,
-                'retail_profit': retail_profit,
-                'wholesale_profit': wholesale_profit,
-                'total_profit': total_profit_item
-            })
-
-            # Accumulate totals
-            total_retail_quantity += retail_quantity
-            total_wholesale_quantity += wholesale_quantity
-            total_quantity += total_quantity_sold
-            total_retail_revenue += retail_revenue
-            total_wholesale_revenue += wholesale_revenue
-            total_revenue += total_revenue_item
-            total_cost += total_cost_item
-            total_retail_profit += retail_profit
-            total_wholesale_profit += wholesale_profit
-            total_profit += total_profit_item
-
-        # Add totals at the bottom
-        result.append({
-            'product_name': 'TOTAL',
-            'sku': '',
-            'buying_price': 0.0,
-            'retail_price': 0.0,
-            'wholesale_price': 0.0,
-            'retail_quantity': total_retail_quantity,
-            'wholesale_quantity': total_wholesale_quantity,
-            'total_quantity': total_quantity,
-            'retail_revenue': total_retail_revenue,
-            'wholesale_revenue': total_wholesale_revenue,
-            'total_revenue': total_revenue,
-            'total_cost': total_cost,
-            'retail_profit': total_retail_profit,
-            'wholesale_profit': total_wholesale_profit,
-            'total_profit': total_profit
-        })
-
-        return result
 
 class InventorySummaryView(generics.GenericAPIView):
     """Get inventory summary for dashboard and reports"""
