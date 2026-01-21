@@ -20,6 +20,7 @@ class Shift(models.Model):
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='open')
     discrepancy = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     approved_by = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_shifts')
+    notes = models.TextField(blank=True, null=True)
     
     def __str__(self):
         return f"Shift {self.id} - {self.cashier.user.username} - {self.status}"

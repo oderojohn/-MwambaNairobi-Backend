@@ -52,6 +52,11 @@ class Sale(models.Model):
     void_reason = models.TextField(blank=True, null=True)
     voided_at = models.DateTimeField(null=True, blank=True)
     voided_by = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_sales')
+
+    # Edit functionality
+    edit_reason = models.TextField(blank=True, null=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    edited_by = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='edited_sales')
     
     def __str__(self):
         return f"Sale {self.receipt_number}"
@@ -143,3 +148,41 @@ class InvoiceItem(models.Model):
     @property
     def total(self):
         return self.subtotal + self.tax_amount - self.discount_amount
+
+
+class AuditLog(models.Model):
+    OPERATION_CHOICES = [
+        ('sale_create', 'Sale Created'),
+        ('sale_complete', 'Sale Completed'),
+        ('sale_void', 'Sale Voided'),
+        ('sale_edit', 'Sale Edited'),
+        ('stock_deduct', 'Stock Deducted'),
+        ('stock_restore', 'Stock Restored'),
+        ('payment_create', 'Payment Created'),
+        ('payment_void', 'Payment Voided'),
+        ('cart_hold', 'Cart Held'),
+        ('cart_void', 'Cart Voided'),
+        ('admin_action', 'Admin Action'),
+    ]
+
+    user = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True)
+    operation = models.CharField(max_length=20, choices=OPERATION_CHOICES)
+    entity_type = models.CharField(max_length=50)  # Sale, Cart, Payment, Product, etc.
+    entity_id = models.PositiveIntegerField()
+    description = models.TextField()
+    old_values = models.JSONField(null=True, blank=True)  # Store previous values
+    new_values = models.JSONField(null=True, blank=True)  # Store new values
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['operation', 'timestamp']),
+            models.Index(fields=['user', 'timestamp']),
+            models.Index(fields=['entity_type', 'entity_id']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.user.username if self.user else 'System'} - {self.operation} - {self.timestamp}"

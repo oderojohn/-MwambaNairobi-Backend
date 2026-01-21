@@ -1,16 +1,19 @@
 from rest_framework import viewsets, status, serializers
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
 from django.db import transaction
 from django.conf import settings
-from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem
-from .serializers import CartSerializer, CartItemSerializer, SaleSerializer, SaleItemSerializer, ReturnSerializer, InvoiceSerializer, InvoiceItemSerializer
+from django.db.models import Q
+from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem, AuditLog
+from .serializers import CartSerializer, CartItemSerializer, SaleSerializer, SaleItemSerializer, ReturnSerializer, InvoiceSerializer, InvoiceItemSerializer, AuditLogSerializer
 from inventory.models import Product, StockMovement, SalesHistory
 from shifts.models import Shift
 from payments.models import Payment
+from .services import sales_service, stock_service, payment_service, audit_service
 
 class CartViewSet(viewsets.ModelViewSet):
     queryset = Cart.objects.all()
@@ -23,6 +26,7 @@ class CartItemViewSet(viewsets.ModelViewSet):
 class SaleViewSet(viewsets.ModelViewSet):
     queryset = Sale.objects.all()
     serializer_class = SaleSerializer
+    pagination_class = PageNumberPagination
 
     @action(detail=False, methods=['get'])
     def held_orders(self, request):
@@ -38,17 +42,12 @@ class SaleViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            current_shift = Shift.objects.get(cashier=cashier, status='open')
-        except Shift.DoesNotExist:
+            held_carts = sales_service.get_held_orders(cashier)
+        except ValueError as e:
             return Response(
-                {'error': 'No active shift found'},
+                {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-        held_carts = Cart.objects.filter(
-            cashier=cashier,
-            status='held'
-        ).prefetch_related('cartitem_set__product').order_by('-created_at')
 
         serializer = CartSerializer(held_carts, many=True)
         return Response(serializer.data)
@@ -91,284 +90,65 @@ class SaleViewSet(viewsets.ModelViewSet):
                 tax_amount = float(request.data.get('tax_amount', 0))
                 discount_amount = float(request.data.get('discount_amount', 0))
                 total_amount = float(request.data.get('total_amount', subtotal + tax_amount - discount_amount))
-                receipt_number = request.data.get('receipt_number', f'POS-{timezone.now().strftime("%Y%m%d%H%M%S")}')
 
-                # Create sale
-                from django.db.models.signals import post_save
-                from .signals import create_default_payment
-
-                # Temporarily disconnect the signal to prevent duplicate payments
-                post_save.disconnect(create_default_payment, sender=Sale)
-
-                sale = Sale.objects.create(
-                    cart=cart,
-                    customer=cart.customer,
-                    shift=current_shift,
-                    sale_type=request.data.get('sale_type', 'retail'),
-                    total_amount=float(subtotal),
-                    tax_amount=float(tax_amount),
-                    discount_amount=float(discount_amount),
-                    final_amount=float(total_amount),
-                    receipt_number=receipt_number
-                )
-
-                # Reconnect the signal
-                post_save.connect(create_default_payment, sender=Sale)
-
-                # Update shift totals
-                payment_method = request.data.get('payment_method', 'cash').lower()
-                from decimal import Decimal
-                sale_amount = Decimal(str(total_amount))
-
-                from django.db.models import F
-                update_fields = ['total_sales']
-                if payment_method == 'split':
-                    # For split payments, use the split data
-                    split_data = request.data.get('split_data', {})
-                    cash_amount = Decimal(str(split_data.get('cash', 0)))
-                    mpesa_amount = Decimal(str(split_data.get('mpesa', 0)))
-                    current_shift.cash_sales = F('cash_sales') + cash_amount
-                    current_shift.mobile_sales = F('mobile_sales') + mpesa_amount
-                    update_fields.extend(['cash_sales', 'mobile_sales'])
-                elif payment_method == 'cash':
-                    current_shift.cash_sales = F('cash_sales') + sale_amount
-                    update_fields.append('cash_sales')
-                elif payment_method in ['mpesa', 'mobile']:
-                    current_shift.mobile_sales = F('mobile_sales') + sale_amount
-                    update_fields.append('mobile_sales')
-
-                current_shift.total_sales = F('total_sales') + sale_amount
-                current_shift.save(update_fields=update_fields)
-
-                # Create sale items
-                for cart_item in cart_items:
-                    SaleItem.objects.create(
-                        sale=sale,
-                        product=cart_item.product,
-                        quantity=int(cart_item.quantity),
-                        unit_price=float(cart_item.unit_price),
-                        discount=float(cart_item.discount)
+                # Validate payment method
+                payment_method = request.data.get('payment_method', '').strip().lower()
+                if not payment_method:
+                    return Response(
+                        {'error': 'Payment method is required for all transactions'},
+                        status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Deduct stock (same logic as in create method)
-                stock_deductions = []
-                for cart_item in cart_items:
-                    product = cart_item.product
-                    requested_quantity = int(cart_item.quantity)
+                try:
+                    payment_service.validate_payment_method(payment_method, request.data.get('split_data'))
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
-                    # Validate quantity is positive
-                    if requested_quantity <= 0:
-                        return Response(
-                            {'error': f'Invalid quantity for product "{product.name}". Quantity must be positive.'},
-                            status=status.HTTP_400_BAD_REQUEST
+                # Create sale
+                sale = sales_service.complete_held_order(cart, request.data, cashier, current_shift)
+
+                # Log sale completion
+                audit_service.log_sale_operation(
+                    user=cashier,
+                    operation='sale_complete',
+                    sale=sale,
+                    description=f'Completed held order {cart.id} into sale {sale.receipt_number}',
+                    request=request
+                )
+
+                # Update shift totals
+                payment_service.update_shift_totals(current_shift, payment_method, total_amount, request.data.get('split_data'))
+
+                # Validate and deduct stock
+                try:
+                    stock_deductions = stock_service.validate_stock_availability(cart_items)
+                    stock_service.deduct_stock(stock_deductions, sale, cashier, request)
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Create payment
+                try:
+                    created_payments = payment_service.create_payment(sale, payment_method, total_amount, request.data)
+                    # Log payment creation
+                    for payment in created_payments:
+                        audit_service.log_payment_operation(
+                            user=cashier,
+                            operation='payment_create',
+                            payment=payment,
+                            description=f'Created payment for sale {sale.receipt_number}',
+                            request=request
                         )
-
-                    if float(product.stock_quantity) < requested_quantity:
-                        return Response(
-                            {'error': f'Insufficient stock for product "{product.name}". Available: {product.stock_quantity}, Requested: {requested_quantity}'},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                    stock_deductions.append({
-                        'product': product,
-                        'quantity': requested_quantity,
-                        'cart_item': cart_item
-                    })
-
-                # Apply stock deductions
-                for deduction in stock_deductions:
-                    product = deduction['product']
-                    remaining_quantity = deduction['quantity']
-
-                    from inventory.models import Batch
-                    available_batches = Batch.objects.filter(
-                        product=product,
-                        quantity__gt=0
-                    ).exclude(
-                        status__in=['damaged', 'expired'],
-                        expiry_date__lt=timezone.now().date()
-                    ).order_by('expiry_date', 'purchase_date')
-
-                    batch_deductions = []
-                    for batch in available_batches:
-                        if remaining_quantity <= 0:
-                            break
-
-                        take_quantity = min(remaining_quantity, batch.quantity)
-                        batch_deductions.append({
-                            'batch': batch,
-                            'quantity': take_quantity
-                        })
-                        remaining_quantity -= take_quantity
-
-                    total_available = sum(d['quantity'] for d in batch_deductions)
-                    if total_available < deduction['quantity']:
-                        if not available_batches.exists() and float(product.stock_quantity) >= deduction['quantity']:
-                            from decimal import Decimal
-                            product.stock_quantity = Decimal(str(product.stock_quantity)) - Decimal(str(deduction['quantity']))
-                            product.save(update_fields=['stock_quantity'])
-
-                            StockMovement.objects.create(
-                                product=product,
-                                movement_type='out',
-                                quantity=-deduction['quantity'],
-                                reason=f'Sale {sale.receipt_number} - No batch tracking',
-                                user=cashier
-                            )
-
-                            SalesHistory.objects.create(
-                                product=product,
-                                batch=None,
-                                quantity=deduction['quantity'],
-                                unit_price=deduction['cart_item'].unit_price,
-                                cost_price=0,
-                                total_price=deduction['cart_item'].unit_price * deduction['quantity'],
-                                receipt_number=sale.receipt_number,
-                                sale_date=sale.sale_date
-                            )
-                            continue
-                        else:
-                            return Response(
-                                {'error': f'Insufficient stock for product "{product.name}". Available: {total_available}, Required: {deduction["quantity"]}'},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-
-                    # Apply batch deductions
-                    for batch_deduction in batch_deductions:
-                        batch = batch_deduction['batch']
-                        quantity = batch_deduction['quantity']
-
-                        from decimal import Decimal
-                        batch.quantity = Decimal(str(batch.quantity)) - Decimal(str(quantity))
-                        batch.save(update_fields=['quantity'])
-
-                        product.stock_quantity = Decimal(str(product.stock_quantity)) - Decimal(str(quantity))
-                        product.save(update_fields=['stock_quantity'])
-
-                        StockMovement.objects.create(
-                            product=product,
-                            movement_type='out',
-                            quantity=-quantity,
-                            reason=f'Sale {sale.receipt_number} - Batch {batch.batch_number}',
-                            user=cashier
-                        )
-
-                        SalesHistory.objects.create(
-                            product=product,
-                            batch=batch,
-                            quantity=quantity,
-                            unit_price=deduction['cart_item'].unit_price,
-                            cost_price=batch.cost_price,
-                            total_price=deduction['cart_item'].unit_price * quantity,
-                            receipt_number=sale.receipt_number,
-                            sale_date=sale.sale_date
-                        )
-
-                # Check if payments already exist for this sale (prevent duplicates)
-                existing_payments = sale.payment_set.filter(status='completed')
-                if existing_payments.exists():
-                    created_payments = list(existing_payments)
-                else:
-                    # Check if payments already exist for this sale (prevent duplicates)
-                    existing_payments = sale.payment_set.filter(status='completed')
-                    if existing_payments.exists():
-                        created_payments = list(existing_payments)
-                    else:
-                        # STRICT VALIDATION: Require payment method and ensure payment creation succeeds
-                        payment_method = request.data.get('payment_method', '').strip().lower()
-                        if not payment_method:
-                            return Response(
-                                {'error': 'Payment method is required for all transactions'},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-    
-                        # Validate payment method
-                        valid_payment_methods = ['cash', 'mpesa', 'mobile', 'split']
-                        if payment_method not in valid_payment_methods:
-                            return Response(
-                                {'error': f'Invalid payment method. Must be one of: {", ".join(valid_payment_methods)}'},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-    
-                        # Validate split payment data if split method selected
-                        if payment_method == 'split':
-                            split_data = request.data.get('split_data', {})
-                            if not split_data or (split_data.get('cash', 0) == 0 and split_data.get('mpesa', 0) == 0):
-                                raise ValueError('Split payment requires cash and/or mpesa amounts in split_data')
-    
-                        # Create payment record for the sale
-                        created_payments = []
-                        if payment_method == 'split':
-                            # For split payments, create appropriate payment records
-                            split_data = request.data.get('split_data', {})
-                            cash_amount = split_data.get('cash', 0)
-                            mpesa_amount = split_data.get('mpesa', 0)
-    
-                            # Check if it's truly split (both amounts > 0) or pure payment
-                            if cash_amount > 0 and mpesa_amount > 0:
-                                # True split payment - create two records
-                                payment = Payment.objects.create(
-                                    sale=sale,
-                                    payment_type='cash',
-                                    amount=cash_amount,
-                                    status='completed'
-                                )
-                                created_payments.append(payment)
-    
-                                payment = Payment.objects.create(
-                                    sale=sale,
-                                    payment_type='mpesa',
-                                    amount=mpesa_amount,
-                                    mpesa_number=request.data.get('mpesa_number', ''),
-                                    status='completed'
-                                )
-                                created_payments.append(payment)
-                            elif mpesa_amount > 0:
-                                # Pure M-Pesa payment
-                                payment = Payment.objects.create(
-                                    sale=sale,
-                                    payment_type='mpesa',
-                                    amount=mpesa_amount,
-                                    mpesa_number=request.data.get('mpesa_number', ''),
-                                    status='completed'
-                                )
-                                created_payments.append(payment)
-                            elif cash_amount > 0:
-                                # Pure cash payment
-                                payment = Payment.objects.create(
-                                    sale=sale,
-                                    payment_type='cash',
-                                    amount=cash_amount,
-                                    status='completed'
-                                )
-                                created_payments.append(payment)
-                        else:
-                            # Single payment method
-                            payment_type = 'cash'
-                            if payment_method in ['mpesa', 'mobile']:
-                                payment_type = 'mpesa'
-    
-                            payment = Payment.objects.create(
-                                sale=sale,
-                                payment_type=payment_type,
-                                amount=total_amount,
-                                mpesa_number=request.data.get('mpesa_number', '') if payment_type == 'mpesa' else '',
-                                status='completed'
-                            )
-                            created_payments.append(payment)
-    
-                        # CRITICAL VALIDATION: Ensure at least one payment was created
-                        if not created_payments:
-                            raise ValueError("No payment records were created for this transaction")
-    
-                        # Verify payment amounts total matches sale amount
-                        total_payment_amount = sum(float(p.amount) for p in created_payments)
-                        if abs(total_payment_amount - float(total_amount)) > 0.01:  # Allow small floating point differences
-                            raise ValueError(f"Payment amount mismatch: payments total {total_payment_amount}, sale total {total_amount}")
-
-                # Update cart status to closed
-                cart.status = 'closed'
-                cart.save()
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
                 # Serialize and return the sale
                 serializer = self.get_serializer(sale)
@@ -435,9 +215,7 @@ class SaleViewSet(viewsets.ModelViewSet):
             )
 
         # Void the order
-        cart.status = 'voided'
-        cart.void_reason = void_reason
-        cart.save()
+        sales_service.void_held_order(cart, void_reason, cashier)
 
         return Response({
             'message': 'Held order voided successfully',
@@ -472,75 +250,19 @@ class SaleViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 # Mark sale as voided
-                sale.voided = True
-                sale.void_reason = void_reason
-                sale.voided_at = timezone.now()
-                sale.voided_by = request.user.userprofile if hasattr(request.user, 'userprofile') else None
-                sale.save()
+                sales_service.void_sale(sale, void_reason, request.user)
 
                 # Restore stock quantities
-                for sale_item in sale.saleitem_set.all():
-                    product = sale_item.product
-                    quantity_to_restore = sale_item.quantity
-
-                    # Validate quantity is positive
-                    if quantity_to_restore <= 0:
-                        return Response(
-                            {'error': f'Invalid quantity for product "{product.name}" in voided sale. Quantity must be positive.'},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                    # Restore product stock
-                    from decimal import Decimal
-                    product.stock_quantity = Decimal(str(product.stock_quantity)) + Decimal(str(quantity_to_restore))
-                    product.save(update_fields=['stock_quantity'])
-
-                    # Create stock movement record
-                    from inventory.models import StockMovement
-                    StockMovement.objects.create(
-                        product=product,
-                        movement_type='in',
-                        quantity=quantity_to_restore,
-                        reason=f'Sale void {sale.receipt_number} - {void_reason}',
-                        user=request.user.userprofile if hasattr(request.user, 'userprofile') else None
+                try:
+                    stock_service.restore_stock(sale, request.user)
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
                     )
-
-                    # Update batch quantities if applicable
-                    from inventory.models import Batch, SalesHistory
-                    sales_history_records = SalesHistory.objects.filter(
-                        product=product,
-                        receipt_number=sale.receipt_number
-                    )
-
-                    for history_record in sales_history_records:
-                        if history_record.batch:
-                            batch = history_record.batch
-                            batch.quantity = Decimal(str(batch.quantity)) + Decimal(str(history_record.quantity))
-                            batch.save(update_fields=['quantity'])
 
                 # Update shift totals (subtract the voided sale)
-                if sale.shift:
-                    from decimal import Decimal
-                    void_amount = Decimal(str(sale.final_amount))
-
-                    # Get payment method from payment record
-                    payment = sale.payment_set.first()
-                    payment_method = payment.payment_type if payment else 'cash'
-
-                    # Subtract from shift totals based on payment method
-                    if payment_method == 'cash':
-                        sale.shift.cash_sales = F('cash_sales') - void_amount
-                        sale.shift.save(update_fields=['cash_sales'])
-                    elif payment_method == 'card':
-                        sale.shift.card_sales = F('card_sales') - void_amount
-                        sale.shift.save(update_fields=['card_sales'])
-                    elif payment_method in ['mpesa', 'mobile']:
-                        sale.shift.mobile_sales = F('mobile_sales') - void_amount
-                        sale.shift.save(update_fields=['mobile_sales'])
-
-                    # Subtract from total sales
-                    sale.shift.total_sales = F('total_sales') - void_amount
-                    sale.shift.save(update_fields=['total_sales'])
+                payment_service.update_shift_totals_on_void(sale.shift, sale)
 
                 return Response({
                     'message': 'Sale voided successfully',
@@ -554,6 +276,867 @@ class SaleViewSet(viewsets.ModelViewSet):
             traceback.print_exc()
             return Response({
                 'error': 'Failed to void sale',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # POS Admin Actions
+    @action(detail=True, methods=['post'], permission_classes=[])
+    def admin_void_sale(self, request, pk=None):
+        """Admin void a completed sale with a reason (requires admin/manager role)"""
+        # Check admin permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required for this action'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if sale is already voided
+        if sale.voided:
+            return Response(
+                {'error': 'Sale is already voided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        void_reason = request.data.get('reason', '').strip()
+        if not void_reason:
+            return Response(
+                {'error': 'Void reason is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                # Mark sale as voided
+                sales_service.void_sale(sale, void_reason, request.user)
+
+                # Log admin void operation
+                audit_service.log_sale_operation(
+                    user=request.user.userprofile,
+                    operation='admin_action',
+                    sale=sale,
+                    description=f'Admin voided sale {sale.receipt_number}: {void_reason}',
+                    request=request
+                )
+
+                # Restore stock quantities
+                try:
+                    stock_service.restore_stock(sale, request.user, request)
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Update shift totals (subtract the voided sale)
+                payment_service.update_shift_totals_on_void(sale.shift, sale)
+
+                return Response({
+                    'message': 'Sale voided successfully by admin',
+                    'void_reason': void_reason,
+                    'sale_id': sale.id,
+                    'voided_by': request.user.username
+                }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f"Error admin voiding sale: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return Response({
+                'error': 'Failed to void sale',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], permission_classes=[])
+    def sales_by_user(self, request):
+        """View sales by user (requires admin/manager role)"""
+        # Check admin permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required for this action'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        user_id = request.query_params.get('user_id')
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        queryset = Sale.objects.filter(voided=False)
+
+        if user_id:
+            queryset = queryset.filter(shift__cashier__user_id=user_id)
+
+        if date_from:
+            queryset = queryset.filter(sale_date__gte=date_from)
+
+        if date_to:
+            queryset = queryset.filter(sale_date__lte=date_to)
+
+        # Group by user
+        sales_by_user = {}
+        for sale in queryset.select_related('shift__cashier__user'):
+            user = sale.shift.cashier.user if sale.shift and sale.shift.cashier else None
+            if user:
+                user_key = f"{user.username} ({user.id})"
+                if user_key not in sales_by_user:
+                    sales_by_user[user_key] = {
+                        'user_id': user.id,
+                        'username': user.username,
+                        'total_sales': 0,
+                        'total_amount': 0,
+                        'sales_count': 0,
+                        'sales': []
+                    }
+
+                sales_by_user[user_key]['total_sales'] += 1
+                sales_by_user[user_key]['total_amount'] += float(sale.final_amount)
+                sales_by_user[user_key]['sales_count'] += 1
+                sales_by_user[user_key]['sales'].append({
+                    'id': sale.id,
+                    'receipt_number': sale.receipt_number,
+                    'final_amount': sale.final_amount,
+                    'sale_date': sale.sale_date
+                })
+
+        return Response({
+            'sales_by_user': sales_by_user,
+            'total_users': len(sales_by_user),
+            'filters': {
+                'user_id': user_id,
+                'date_from': date_from,
+                'date_to': date_to
+            }
+        })
+
+    @action(detail=True, methods=['patch'], permission_classes=[])
+    def admin_edit_sale(self, request, pk=None):
+        """Admin/Manager edit sale details (requires admin or manager role)"""
+        # Check admin/manager permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required for this action'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Prevent editing voided sales
+        if sale.voided:
+            return Response(
+                {'error': 'Cannot edit voided sales'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Allowed fields for editing
+        allowed_fields = ['tax_amount', 'discount_amount', 'final_amount', 'receipt_number', 'edit_reason']
+        updated_fields = []
+
+        # Handle item quantity changes
+        items_changed = False
+        if 'items' in request.data and isinstance(request.data['items'], list):
+            items_changed = True
+            stock_adjustments = []
+            total_amount_change = 0
+
+            for item_data in request.data['items']:
+                item_id = item_data.get('id')
+                new_quantity = int(item_data.get('quantity', 0))
+
+                if not item_id or new_quantity < 0:
+                    continue
+
+                try:
+                    sale_item = SaleItem.objects.get(id=item_id, sale=sale)
+                    old_quantity = sale_item.quantity
+
+                    if new_quantity != old_quantity:
+                        quantity_diff = new_quantity - old_quantity
+
+                        # Calculate amount change
+                        amount_change = float(sale_item.unit_price) * quantity_diff
+                        total_amount_change += amount_change
+
+                        # Prepare stock adjustment
+                        stock_adjustments.append({
+                            'product': sale_item.product,
+                            'quantity_diff': quantity_diff,
+                            'sale_item': sale_item,
+                            'old_quantity': old_quantity,
+                            'new_quantity': new_quantity
+                        })
+
+                        # Update sale item quantity
+                        sale_item.quantity = new_quantity
+                        sale_item.save()
+
+                        updated_fields.append({
+                            'field': f'item_{sale_item.product.name}_quantity',
+                            'old_value': old_quantity,
+                            'new_value': new_quantity
+                        })
+
+                except SaleItem.DoesNotExist:
+                    continue
+
+            # Apply stock adjustments
+            if stock_adjustments:
+                for adjustment in stock_adjustments:
+                    if adjustment['quantity_diff'] > 0:
+                        # Additional stock deduction needed
+                        stock_service.deduct_stock(
+                            [{adjustment['product']: adjustment['quantity_diff']}],
+                            sale,
+                            request.user,
+                            request
+                        )
+                    elif adjustment['quantity_diff'] < 0:
+                        # Stock restoration needed
+                        stock_service.restore_stock_quantity(
+                            adjustment['product'],
+                            abs(adjustment['quantity_diff']),
+                            sale,
+                            request.user,
+                            request
+                        )
+
+            # Update sale totals if items changed
+            if total_amount_change != 0:
+                sale.total_amount += Decimal(str(total_amount_change))
+                sale.final_amount = sale.total_amount + sale.tax_amount - sale.discount_amount
+                updated_fields.append({
+                    'field': 'total_amount',
+                    'old_value': 'auto-calculated',
+                    'new_value': float(sale.total_amount)
+                })
+                updated_fields.append({
+                    'field': 'final_amount',
+                    'old_value': 'auto-calculated',
+                    'new_value': float(sale.final_amount)
+                })
+
+        for field in allowed_fields:
+            if field in request.data:
+                old_value = getattr(sale, field)
+                new_value = request.data[field]
+
+                # Basic validation
+                if field in ['tax_amount', 'discount_amount', 'final_amount']:
+                    try:
+                        new_value = float(new_value)
+                        if new_value < 0:
+                            return Response(
+                                {'error': f'{field} cannot be negative'},
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+                    except (ValueError, TypeError):
+                        return Response(
+                            {'error': f'Invalid value for {field}'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                setattr(sale, field, new_value)
+                updated_fields.append({
+                    'field': field,
+                    'old_value': old_value,
+                    'new_value': new_value
+                })
+
+        if not updated_fields:
+            return Response(
+                {'error': 'No valid fields to update'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Recalculate final amount if tax or discount changed
+        if any(f['field'] in ['tax_amount', 'discount_amount'] for f in updated_fields):
+            sale.final_amount = sale.total_amount + sale.tax_amount - sale.discount_amount
+            updated_fields.append({
+                'field': 'final_amount',
+                'old_value': 'auto-calculated',
+                'new_value': sale.final_amount
+            })
+
+        # Set edit tracking fields if edit_reason is provided
+        if 'edit_reason' in request.data and request.data['edit_reason'].strip():
+            sale.edited_by = request.user.userprofile
+            sale.edited_at = timezone.now()
+            updated_fields.append({
+                'field': 'edited_by',
+                'old_value': sale.edited_by.user.username if sale.edited_by else None,
+                'new_value': request.user.username
+            })
+            updated_fields.append({
+                'field': 'edited_at',
+                'old_value': sale.edited_at,
+                'new_value': sale.edited_at
+            })
+
+        # Store old final amount for shift total adjustment
+        old_final_amount = float(sale.final_amount)
+
+        sale.save()
+
+        # Update shift totals if final amount changed
+        new_final_amount = float(sale.final_amount)
+        if new_final_amount != old_final_amount:
+            amount_diff = new_final_amount - old_final_amount
+            if sale.shift:
+                # Get payment method from payment record
+                payment = sale.payment_set.first()
+                payment_method = payment.payment_type if payment else 'cash'
+
+                # Update shift totals based on payment method
+                if payment_method == 'cash':
+                    sale.shift.cash_sales = F('cash_sales') + amount_diff
+                    sale.shift.save(update_fields=['cash_sales'])
+                elif payment_method == 'card':
+                    sale.shift.card_sales = F('card_sales') + amount_diff
+                    sale.shift.save(update_fields=['card_sales'])
+                elif payment_method in ['mpesa', 'mobile']:
+                    sale.shift.mobile_sales = F('mobile_sales') + amount_diff
+                    sale.shift.save(update_fields=['mobile_sales'])
+
+                # Update total sales
+                sale.shift.total_sales = F('total_sales') + amount_diff
+                sale.shift.save(update_fields=['total_sales'])
+
+        # Log admin edit operation
+        audit_service.log_sale_operation(
+            user=request.user.userprofile,
+            operation='sale_edit',
+            sale=sale,
+            description=f'Admin edited sale {sale.receipt_number}: {sale.edit_reason or "No reason provided"}',
+            old_values={f['field']: f['old_value'] for f in updated_fields},
+            new_values={f['field']: f['new_value'] for f in updated_fields},
+            request=request
+        )
+
+        return Response({
+            'message': 'Sale updated successfully',
+            'sale_id': sale.id,
+            'updated_fields': updated_fields,
+            'updated_by': request.user.username
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[])
+    def sales_by_date(self, request):
+        """View all sales by date (Admin/Manager only)"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        status_filter = request.query_params.get('status')  # completed, voided, held
+
+        queryset = Sale.objects.select_related('customer', 'shift__cashier__user')
+
+        # Apply branch filter for managers
+        if request.user.userprofile.role == 'manager' and request.user.userprofile.branch:
+            queryset = queryset.filter(shift__cashier__branch=request.user.userprofile.branch)
+
+        # Date filters
+        if date_from:
+            queryset = queryset.filter(sale_date__date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(sale_date__date__lte=date_to)
+
+        # Status filter
+        if status_filter:
+            if status_filter == 'voided':
+                queryset = queryset.filter(voided=True)
+            elif status_filter == 'held':
+                queryset = queryset.filter(cart__status='held')
+            elif status_filter == 'completed':
+                queryset = queryset.filter(voided=False, cart__status='closed')
+
+        # Group by date
+        sales_by_date = {}
+        for sale in queryset.order_by('-sale_date'):
+            date_key = sale.sale_date.date().isoformat()
+            if date_key not in sales_by_date:
+                sales_by_date[date_key] = {
+                    'date': date_key,
+                    'total_sales': 0,
+                    'total_amount': 0,
+                    'voided_count': 0,
+                    'completed_count': 0,
+                    'sales': []
+                }
+
+            sales_by_date[date_key]['total_sales'] += 1
+            sales_by_date[date_key]['total_amount'] += float(sale.final_amount)
+
+            if sale.voided:
+                sales_by_date[date_key]['voided_count'] += 1
+            else:
+                sales_by_date[date_key]['completed_count'] += 1
+
+            sales_by_date[date_key]['sales'].append({
+                'id': sale.id,
+                'receipt_number': sale.receipt_number,
+                'customer': sale.customer.name if sale.customer else None,
+                'cashier': sale.shift.cashier.user.username if sale.shift and sale.shift.cashier else None,
+                'final_amount': sale.final_amount,
+                'voided': sale.voided,
+                'sale_date': sale.sale_date,
+                'item_count': sale.saleitem_set.count()
+            })
+
+        return Response({
+            'sales_by_date': sales_by_date,
+            'total_dates': len(sales_by_date),
+            'filters': {
+                'date_from': date_from,
+                'date_to': date_to,
+                'status': status_filter
+            }
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[])
+    def held_orders_admin(self, request):
+        """View all held orders for admin/manager review"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        queryset = Cart.objects.filter(status='held').select_related('customer', 'cashier__user')
+
+        # Branch filter for managers
+        if request.user.userprofile.role == 'manager' and request.user.userprofile.branch:
+            queryset = queryset.filter(cashier__branch=request.user.userprofile.branch)
+
+        held_orders = []
+        for cart in queryset.order_by('-created_at'):
+            items = cart.cartitem_set.select_related('product')
+            held_orders.append({
+                'id': cart.id,
+                'customer': cart.customer.name if cart.customer else None,
+                'cashier': cart.cashier.user.username if cart.cashier else None,
+                'created_at': cart.created_at,
+                'item_count': items.count(),
+                'total_quantity': sum(item.quantity for item in items),
+                'estimated_total': sum(float(item.unit_price) * item.quantity for item in items),
+                'items': [{
+                    'product': item.product.name,
+                    'quantity': item.quantity,
+                    'unit_price': item.unit_price,
+                    'total': float(item.unit_price) * item.quantity
+                } for item in items]
+            })
+
+        return Response({
+            'held_orders': held_orders,
+            'total_count': len(held_orders)
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[])
+    def voided_orders(self, request):
+        """View all voided sales and orders (Admin/Manager only)"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+
+        # Voided sales
+        voided_sales_queryset = Sale.objects.filter(voided=True).select_related('customer', 'shift__cashier__user', 'voided_by__user')
+
+        # Branch filter for managers
+        if request.user.userprofile.role == 'manager' and request.user.userprofile.branch:
+            voided_sales_queryset = voided_sales_queryset.filter(shift__cashier__branch=request.user.userprofile.branch)
+
+        # Date filters
+        if date_from:
+            voided_sales_queryset = voided_sales_queryset.filter(sale_date__date__gte=date_from)
+        if date_to:
+            voided_sales_queryset = voided_sales_queryset.filter(sale_date__date__lte=date_to)
+
+        voided_sales = []
+        for sale in voided_sales_queryset.order_by('-voided_at'):
+            items = sale.saleitem_set.select_related('product')
+            voided_sales.append({
+                'id': sale.id,
+                'type': 'sale',
+                'receipt_number': sale.receipt_number,
+                'customer': sale.customer.name if sale.customer else None,
+                'cashier': sale.shift.cashier.user.username if sale.shift and sale.shift.cashier else None,
+                'void_reason': sale.void_reason,
+                'voided_by': sale.voided_by.user.username if sale.voided_by else None,
+                'voided_at': sale.voided_at,
+                'original_amount': sale.final_amount,
+                'item_count': items.count(),
+                'items': [{
+                    'product': item.product.name,
+                    'quantity': item.quantity,
+                    'unit_price': item.unit_price
+                } for item in items]
+            })
+
+        # Voided carts (held orders that were voided)
+        voided_carts_queryset = Cart.objects.filter(status='voided').select_related('customer', 'cashier__user')
+
+        if request.user.userprofile.role == 'manager' and request.user.userprofile.branch:
+            voided_carts_queryset = voided_carts_queryset.filter(cashier__branch=request.user.userprofile.branch)
+
+        voided_carts = []
+        for cart in voided_carts_queryset.order_by('-created_at'):
+            items = cart.cartitem_set.select_related('product')
+            voided_carts.append({
+                'id': cart.id,
+                'type': 'cart',
+                'customer': cart.customer.name if cart.customer else None,
+                'cashier': cart.cashier.user.username if cart.cashier else None,
+                'void_reason': cart.void_reason,
+                'voided_at': cart.created_at,  # No specific void timestamp for carts
+                'estimated_amount': sum(float(item.unit_price) * item.quantity for item in items),
+                'item_count': items.count(),
+                'items': [{
+                    'product': item.product.name,
+                    'quantity': item.quantity,
+                    'unit_price': item.unit_price
+                } for item in items]
+            })
+
+        return Response({
+            'voided_sales': voided_sales,
+            'voided_carts': voided_carts,
+            'total_voided': len(voided_sales) + len(voided_carts),
+            'filters': {
+                'date_from': date_from,
+                'date_to': date_to
+            }
+        })
+
+    @action(detail=True, methods=['get'], permission_classes=[])
+    def transaction_details(self, request, pk=None):
+        """Get detailed transaction information including all items (Admin/Manager only)"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.select_related('customer', 'shift__cashier__user', 'cart').get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check branch access for managers
+        if (request.user.userprofile.role == 'manager' and request.user.userprofile.branch and
+            sale.shift and sale.shift.cashier and sale.shift.cashier.branch != request.user.userprofile.branch):
+            return Response(
+                {'error': 'Access denied - sale from different branch'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Get sale items with product details
+        items = sale.saleitem_set.select_related('product').order_by('product__name')
+
+        # Get payment details
+        payments = sale.payment_set.select_related('sale').order_by('created_at')
+
+        # Get audit logs for this sale
+        audit_logs = AuditLog.objects.filter(
+            entity_type='Sale',
+            entity_id=sale.id
+        ).select_related('user__user').order_by('-timestamp')[:10]  # Last 10 operations
+
+        transaction_data = {
+            'sale': {
+                'id': sale.id,
+                'receipt_number': sale.receipt_number,
+                'sale_date': sale.sale_date,
+                'customer': sale.customer.name if sale.customer else None,
+                'cashier': sale.shift.cashier.user.username if sale.shift and sale.shift.cashier else None,
+                'sale_type': sale.sale_type,
+                'voided': sale.voided,
+                'void_reason': sale.void_reason,
+                'voided_by': sale.voided_by.user.username if sale.voided_by else None,
+                'voided_at': sale.voided_at,
+            },
+            'financials': {
+                'subtotal': sale.total_amount,
+                'tax_amount': sale.tax_amount,
+                'discount_amount': sale.discount_amount,
+                'final_amount': sale.final_amount,
+            },
+            'items': [{
+                'id': item.id,
+                'product': item.product.name,
+                'product_id': item.product.id,
+                'quantity': item.quantity,
+                'unit_price': item.unit_price,
+                'discount': item.discount,
+                'line_total': (item.unit_price * item.quantity) - item.discount
+            } for item in items],
+            'payments': [{
+                'id': payment.id,
+                'payment_type': payment.payment_type,
+                'amount': payment.amount,
+                'status': payment.status,
+                'mpesa_number': payment.mpesa_number,
+                'created_at': payment.created_at
+            } for payment in payments],
+            'audit_trail': [{
+                'id': log.id,
+                'operation': log.operation,
+                'description': log.description,
+                'user': log.user.user.username if log.user else 'System',
+                'timestamp': log.timestamp,
+                'old_values': log.old_values,
+                'new_values': log.new_values
+            } for log in audit_logs]
+        }
+
+        return Response(transaction_data)
+
+    @action(detail=True, methods=['patch'], permission_classes=[])
+    def edit_transaction(self, request, pk=None):
+        """Edit entire transaction including items (Admin/Manager only)"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.select_related('cart').get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check branch access for managers
+        if (request.user.userprofile.role == 'manager' and request.user.userprofile.branch and
+            sale.shift and sale.shift.cashier and sale.shift.cashier.branch != request.user.userprofile.branch):
+            return Response(
+                {'error': 'Access denied - sale from different branch'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if sale.voided:
+            return Response(
+                {'error': 'Cannot edit voided sales'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        updated_fields = []
+        old_sale_data = {
+            'total_amount': sale.total_amount,
+            'tax_amount': sale.tax_amount,
+            'discount_amount': sale.discount_amount,
+            'final_amount': sale.final_amount,
+            'receipt_number': sale.receipt_number
+        }
+
+        # Update sale header fields
+        sale_fields = ['tax_amount', 'discount_amount', 'receipt_number']
+        for field in sale_fields:
+            if field in request.data:
+                old_value = getattr(sale, field)
+                new_value = request.data[field]
+
+                if field in ['tax_amount', 'discount_amount']:
+                    try:
+                        new_value = float(new_value)
+                        if new_value < 0:
+                            return Response(
+                                {'error': f'{field} cannot be negative'},
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+                    except (ValueError, TypeError):
+                        return Response(
+                            {'error': f'Invalid value for {field}'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                setattr(sale, field, new_value)
+                updated_fields.append({
+                    'field': field,
+                    'old_value': old_value,
+                    'new_value': new_value
+                })
+
+        # Recalculate final amount
+        sale.final_amount = sale.total_amount + sale.tax_amount - sale.discount_amount
+        updated_fields.append({
+            'field': 'final_amount',
+            'old_value': old_sale_data['final_amount'],
+            'new_value': sale.final_amount
+        })
+
+        # Handle item updates if provided
+        if 'items' in request.data:
+            items_data = request.data['items']
+            existing_items = {item.id: item for item in sale.saleitem_set.all()}
+
+            for item_data in items_data:
+                item_id = item_data.get('id')
+                if item_id and item_id in existing_items:
+                    # Update existing item
+                    item = existing_items[item_id]
+                    old_item_data = {
+                        'quantity': item.quantity,
+                        'unit_price': item.unit_price,
+                        'discount': item.discount
+                    }
+
+                    item.quantity = item_data.get('quantity', item.quantity)
+                    item.unit_price = item_data.get('unit_price', item.unit_price)
+                    item.discount = item_data.get('discount', item.discount)
+                    item.save()
+
+                    updated_fields.append({
+                        'field': f'item_{item_id}',
+                        'old_value': old_item_data,
+                        'new_value': {
+                            'quantity': item.quantity,
+                            'unit_price': item.unit_price,
+                            'discount': item.discount
+                        }
+                    })
+
+            # Recalculate sale totals based on items
+            items = sale.saleitem_set.all()
+            sale.total_amount = sum(float(item.unit_price) * item.quantity for item in items)
+            sale.final_amount = sale.total_amount + sale.tax_amount - sale.discount_amount
+
+        sale.save()
+
+        # Log the comprehensive edit
+        audit_service.log_sale_operation(
+            user=request.user.userprofile,
+            operation='admin_action',
+            sale=sale,
+            description=f'Comprehensive transaction edit by {request.user.userprofile.role}',
+            old_values=old_sale_data,
+            new_values={
+                'total_amount': sale.total_amount,
+                'tax_amount': sale.tax_amount,
+                'discount_amount': sale.discount_amount,
+                'final_amount': sale.final_amount,
+                'receipt_number': sale.receipt_number
+            },
+            request=request
+        )
+
+        return Response({
+            'message': 'Transaction updated successfully',
+            'sale_id': sale.id,
+            'updated_fields': updated_fields,
+            'new_totals': {
+                'total_amount': sale.total_amount,
+                'tax_amount': sale.tax_amount,
+                'discount_amount': sale.discount_amount,
+                'final_amount': sale.final_amount
+            },
+            'updated_by': request.user.username
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[])
+    def void_transaction(self, request, pk=None):
+        """Void entire transaction and restock all items (Admin/Manager only)"""
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check branch access for managers
+        if (request.user.userprofile.role == 'manager' and request.user.userprofile.branch and
+            sale.shift and sale.shift.cashier and sale.shift.cashier.branch != request.user.userprofile.branch):
+            return Response(
+                {'error': 'Access denied - sale from different branch'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if sale.voided:
+            return Response(
+                {'error': 'Sale is already voided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        void_reason = request.data.get('reason', '').strip()
+        if not void_reason:
+            return Response(
+                {'error': 'Void reason is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                # Mark sale as voided
+                sales_service.void_sale(sale, void_reason, request.user)
+
+                # Restock all items
+                try:
+                    stock_service.restore_stock(sale, request.user, request)
+                except ValueError as e:
+                    return Response(
+                        {'error': f'Stock restoration failed: {str(e)}'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Update shift totals (subtract the voided sale)
+                payment_service.update_shift_totals_on_void(sale.shift, sale)
+
+                # Log comprehensive void operation
+                audit_service.log_sale_operation(
+                    user=request.user.userprofile,
+                    operation='sale_void',
+                    sale=sale,
+                    description=f'Complete transaction void by {request.user.userprofile.role}: {void_reason}',
+                    request=request
+                )
+
+                return Response({
+                    'message': 'Transaction voided successfully - all items restocked',
+                    'sale_id': sale.id,
+                    'void_reason': void_reason,
+                    'items_restocked': sale.saleitem_set.count(),
+                    'amount_refunded': sale.final_amount,
+                    'voided_by': request.user.username
+                }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f"Error voiding transaction: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return Response({
+                'error': 'Failed to void transaction',
                 'details': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -632,50 +1215,12 @@ class SaleViewSet(viewsets.ModelViewSet):
                 # Get customer if provided (needed for wholesale validation)
                 customer_id = request.data.get('customer')
 
-                # Validate stock availability and prepare stock deduction
-                stock_deductions = []
-                total_quantity = 0
-                for cart_item in cart_items:
-                    product = cart_item.product
-                    requested_quantity = int(cart_item.quantity)
-
-                    # Validate quantity is positive
-                    if requested_quantity <= 0:
-                        return Response(
-                            {'error': f'Invalid quantity for product "{product.name}". Quantity must be positive.'},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                    total_quantity += requested_quantity
-
-                    if float(product.stock_quantity) < requested_quantity:
-                        return Response(
-                            {'error': f'Insufficient stock for product "{product.name}". Available: {product.stock_quantity}, Requested: {requested_quantity}'},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
-
-                    # Wholesale validation: Check minimum quantity if wholesale price is used
-                    if sale_type == 'wholesale' and hasattr(product, 'wholesale_price') and product.wholesale_price and product.wholesale_price > 0:
-                        # Minimum quantity is always 1 for all sales (no wholesale minimum check)
-                        min_quantity = 1
-                        if requested_quantity < min_quantity:
-                            return Response(
-                                {'error': f'Product "{product.name}" requires minimum {min_quantity} units. Requested: {requested_quantity}'},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-
-                    stock_deductions.append({
-                        'product': product,
-                        'quantity': requested_quantity,
-                        'cart_item': cart_item
-                    })
-
-                # Wholesale validation: Minimum total order quantity
-                # Minimum quantity is always 1 for all sales (no wholesale minimum check)
-                min_total_quantity = 1
-                if sale_type == 'wholesale' and total_quantity < min_total_quantity:
+                # Validate stock availability
+                try:
+                    stock_deductions = stock_service.validate_stock_availability(cart_items)
+                except ValueError as e:
                     return Response(
-                        {'error': f'Orders require minimum {min_total_quantity} items total. Current total: {total_quantity}'},
+                        {'error': str(e)},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
@@ -709,173 +1254,22 @@ class SaleViewSet(viewsets.ModelViewSet):
                     return Response(cart_serializer.data, status=status.HTTP_201_CREATED)
 
                 # Create sale
-                print(f"Creating sale with subtotal: {subtotal} (type: {type(subtotal)}), total_amount: {total_amount} (type: {type(total_amount)})")
+                sale = sales_service.create_sale_from_cart(cart, request.data, cashier, current_shift)
 
-                # Check credit limit for wholesale customers - REMOVED as per requirements
+                # Update shift totals
+                payment_method = request.data.get('payment_method', 'cash').lower()
+                payment_service.update_shift_totals(current_shift, payment_method, total_amount, request.data.get('split_data'))
 
-                from django.db.models.signals import post_save
-                from .signals import create_default_payment
-
-                # Temporarily disconnect the signal to prevent duplicate payments
-                post_save.disconnect(create_default_payment, sender=Sale)
-
-                sale = Sale.objects.create(
-                    cart=cart,
-                    customer=customer,
-                    shift=current_shift,
-                    sale_type=request.data.get('sale_type', 'retail'),
-                    total_amount=float(subtotal),
-                    tax_amount=float(tax_amount),
-                    discount_amount=float(discount_amount),
-                    final_amount=float(total_amount),
-                    receipt_number=receipt_number
-                )
-
-                # Reconnect the signal
-                post_save.connect(create_default_payment, sender=Sale)
-
-                # Update shift totals if there's an active shift
-                if current_shift:
-                    from decimal import Decimal
-                    payment_method = request.data.get('payment_method', 'cash').lower()
-                    sale_amount = Decimal(str(total_amount))
-
-                    # Update shift totals based on payment method using F expressions to avoid race conditions
-                    from django.db.models import F
-                    update_fields = ['total_sales']
-                    if payment_method == 'split':
-                        # For split payments, use the split data
-                        split_data = request.data.get('split_data', {})
-                        cash_amount = Decimal(str(split_data.get('cash', 0)))
-                        mpesa_amount = Decimal(str(split_data.get('mpesa', 0)))
-                        current_shift.cash_sales = F('cash_sales') + cash_amount
-                        current_shift.mobile_sales = F('mobile_sales') + mpesa_amount
-                        update_fields.extend(['cash_sales', 'mobile_sales'])
-                    elif payment_method == 'cash':
-                        current_shift.cash_sales = F('cash_sales') + sale_amount
-                        update_fields.append('cash_sales')
-                    elif payment_method in ['mpesa', 'mobile']:
-                        current_shift.mobile_sales = F('mobile_sales') + sale_amount
-                        update_fields.append('mobile_sales')
-
-                    current_shift.total_sales = F('total_sales') + sale_amount
-                    current_shift.save(update_fields=update_fields)
-
-                # Create sale items from cart items
-                for cart_item in cart_items:
-                    print(f"Creating sale item: quantity={cart_item.quantity} (type: {type(cart_item.quantity)}), unit_price={cart_item.unit_price} (type: {type(cart_item.unit_price)})")
-                    SaleItem.objects.create(
-                        sale=sale,
-                        product=cart_item.product,
-                        quantity=int(cart_item.quantity),
-                        unit_price=float(cart_item.unit_price),
-                        discount=float(cart_item.discount)
+                # Deduct stock
+                try:
+                    stock_service.deduct_stock(stock_deductions, sale, cashier)
+                except ValueError as e:
+                    return Response(
+                        {'error': str(e)},
+                        status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Deduct stock using FIFO (First-In, First-Out) from batches
-                for deduction in stock_deductions:
-                    product = deduction['product']
-                    remaining_quantity = deduction['quantity']
-
-                    # Get available batches for this product, ordered by expiry date (FIFO)
-                    from inventory.models import Batch
-                    available_batches = Batch.objects.filter(
-                        product=product,
-                        quantity__gt=0
-                    ).exclude(
-                        status__in=['damaged', 'expired'],  # Exclude damaged/expired batches
-                        expiry_date__lt=timezone.now().date()  # Don't use expired batches
-                    ).order_by('expiry_date', 'purchase_date')  # FIFO: oldest first
-
-                    batch_deductions = []
-                    for batch in available_batches:
-                        if remaining_quantity <= 0:
-                            break
-
-                        # Calculate how much to take from this batch
-                        take_quantity = min(remaining_quantity, batch.quantity)
-
-                        batch_deductions.append({
-                            'batch': batch,
-                            'quantity': take_quantity
-                        })
-
-                        remaining_quantity -= take_quantity
-
-                    # Check if we have enough stock across all batches
-                    total_available = sum(d['quantity'] for d in batch_deductions)
-                    if total_available < deduction['quantity']:
-                        # If no batches found but product has stock, allow the sale (fallback for missing batch data)
-                        if not available_batches.exists() and float(product.stock_quantity) >= deduction['quantity']:
-                            print(f"No batches found for product {product.name}, but product has {product.stock_quantity} stock. Allowing sale.")
-                            # Skip batch deduction logic and just reduce product stock
-                            from decimal import Decimal
-                            product.stock_quantity = Decimal(str(product.stock_quantity)) - Decimal(str(deduction['quantity']))
-                            product.save(update_fields=['stock_quantity'])
-
-                            # Create stock movement record without batch
-                            StockMovement.objects.create(
-                                product=product,
-                                movement_type='out',
-                                quantity=-deduction['quantity'],
-                                reason=f'Sale {sale.receipt_number} - No batch tracking',
-                                user=cashier
-                            )
-
-                            # Create sales history record without batch
-                            SalesHistory.objects.create(
-                                product=product,
-                                batch=None,  # No batch
-                                quantity=deduction['quantity'],
-                                unit_price=deduction['cart_item'].unit_price,
-                                cost_price=None,  # Unknown cost
-                                total_price=deduction['cart_item'].unit_price * deduction['quantity'],
-                                receipt_number=sale.receipt_number,
-                                sale_date=sale.sale_date
-                            )
-                            continue  # Skip the rest of batch processing
-                        else:
-                            return Response(
-                                {'error': f'Insufficient stock for product "{product.name}". Available: {total_available}, Required: {deduction["quantity"]}'},
-                                status=status.HTTP_400_BAD_REQUEST
-                            )
-
-                    # Apply the deductions
-                    for batch_deduction in batch_deductions:
-                        batch = batch_deduction['batch']
-                        quantity = batch_deduction['quantity']
-
-                        # Reduce batch quantity
-                        from decimal import Decimal
-                        batch.quantity = Decimal(str(batch.quantity)) - Decimal(str(quantity))
-                        batch.save(update_fields=['quantity'])
-
-                        # Deduct from product total stock
-                        product.stock_quantity = Decimal(str(product.stock_quantity)) - Decimal(str(quantity))
-                        product.save(update_fields=['stock_quantity'])
-
-                        # Create stock movement record
-                        StockMovement.objects.create(
-                            product=product,
-                            movement_type='out',
-                            quantity=-quantity,  # Negative for stock out
-                            reason=f'Sale {sale.receipt_number} - Batch {batch.batch_number}',
-                            user=cashier
-                        )
-
-                        # Create sales history record with batch information
-                        SalesHistory.objects.create(
-                            product=product,
-                            batch=batch,
-                            quantity=quantity,
-                            unit_price=deduction['cart_item'].unit_price,
-                            cost_price=batch.cost_price,
-                            total_price=deduction['cart_item'].unit_price * quantity,
-                            receipt_number=sale.receipt_number,
-                            sale_date=sale.sale_date
-                        )
-
-                # STRICT VALIDATION: Require payment method and ensure payment creation succeeds
+                # Validate and create payment
                 payment_method = request.data.get('payment_method', '').strip().lower()
                 if not payment_method:
                     return Response(
@@ -883,89 +1277,14 @@ class SaleViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Validate payment method
-                valid_payment_methods = ['cash', 'mpesa', 'mobile', 'split']
-                if payment_method not in valid_payment_methods:
+                try:
+                    payment_service.validate_payment_method(payment_method, request.data.get('split_data'))
+                    created_payments = payment_service.create_payment(sale, payment_method, total_amount, request.data)
+                except ValueError as e:
                     return Response(
-                        {'error': f'Invalid payment method. Must be one of: {", ".join(valid_payment_methods)}'},
+                        {'error': str(e)},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-
-                # Validate split payment data if split method selected
-                if payment_method == 'split':
-                    split_data = request.data.get('split_data', {})
-                    if not split_data or (split_data.get('cash', 0) == 0 and split_data.get('mpesa', 0) == 0):
-                        raise ValueError('Split payment requires cash and/or mpesa amounts in split_data')
-
-                # Create payment record for the sale
-                created_payments = []
-                if payment_method == 'split':
-                    # For split payments, create appropriate payment records
-                    split_data = request.data.get('split_data', {})
-                    cash_amount = split_data.get('cash', 0)
-                    mpesa_amount = split_data.get('mpesa', 0)
-
-                    # Check if it's truly split (both amounts > 0) or pure payment
-                    if cash_amount > 0 and mpesa_amount > 0:
-                        # True split payment - create two records
-                        payment = Payment.objects.create(
-                            sale=sale,
-                            payment_type='cash',
-                            amount=cash_amount,
-                            status='completed'
-                        )
-                        created_payments.append(payment)
-
-                        payment = Payment.objects.create(
-                            sale=sale,
-                            payment_type='mpesa',
-                            amount=mpesa_amount,
-                            mpesa_number=request.data.get('mpesa_number', ''),
-                            status='completed'
-                        )
-                        created_payments.append(payment)
-                    elif mpesa_amount > 0:
-                        # Pure M-Pesa payment
-                        payment = Payment.objects.create(
-                            sale=sale,
-                            payment_type='mpesa',
-                            amount=mpesa_amount,
-                            mpesa_number=request.data.get('mpesa_number', ''),
-                            status='completed'
-                        )
-                        created_payments.append(payment)
-                    elif cash_amount > 0:
-                        # Pure cash payment
-                        payment = Payment.objects.create(
-                            sale=sale,
-                            payment_type='cash',
-                            amount=cash_amount,
-                            status='completed'
-                        )
-                        created_payments.append(payment)
-                else:
-                    # Single payment method
-                    payment_type = 'cash'
-                    if payment_method in ['mpesa', 'mobile']:
-                        payment_type = 'mpesa'
-
-                    payment = Payment.objects.create(
-                        sale=sale,
-                        payment_type=payment_type,
-                        amount=total_amount,
-                        mpesa_number=request.data.get('mpesa_number', '') if payment_type == 'mpesa' else '',
-                        status='completed'
-                    )
-                    created_payments.append(payment)
-
-                # CRITICAL VALIDATION: Ensure at least one payment was created
-                if not created_payments:
-                    raise ValueError("No payment records were created for this transaction")
-
-                # Verify payment amounts total matches sale amount
-                total_payment_amount = sum(float(p.amount) for p in created_payments)
-                if abs(total_payment_amount - float(total_amount)) > 0.01:  # Allow small floating point differences
-                    raise ValueError(f"Payment amount mismatch: payments total {total_payment_amount}, sale total {total_amount}")
 
                 # Serialize and return the sale
                 serializer = self.get_serializer(sale)
@@ -1099,3 +1418,35 @@ class InvoiceItemViewSet(viewsets.ModelViewSet):
     search_fields = ['description', 'product__name']
     ordering_fields = ['quantity', 'unit_price']
     ordering = ['description']
+
+
+class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only viewset for audit logs (admin/manager only)"""
+    queryset = AuditLog.objects.all()
+    serializer_class = AuditLogSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['operation', 'user', 'entity_type']
+    search_fields = ['description', 'user__user__username']
+    ordering_fields = ['timestamp', 'operation']
+    ordering = ['-timestamp']
+
+    def get_queryset(self):
+        """Filter audit logs based on user permissions"""
+        queryset = super().get_queryset()
+
+        # Only admin and manager can view audit logs
+        if not hasattr(self.request.user, 'userprofile'):
+            return queryset.none()
+
+        user_profile = self.request.user.userprofile
+        if user_profile.role not in ['admin', 'manager']:
+            return queryset.none()
+
+        # Managers can only see logs from their branch
+        if user_profile.role == 'manager' and user_profile.branch:
+            queryset = queryset.filter(
+                Q(user__branch=user_profile.branch) |
+                Q(user__isnull=True)  # System operations
+            )
+
+        return queryset

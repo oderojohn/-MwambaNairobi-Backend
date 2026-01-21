@@ -6,6 +6,8 @@ class ShiftSerializer(serializers.ModelSerializer):
     cashier_name = serializers.SerializerMethodField()
     approved_by_name = serializers.SerializerMethodField()
     transaction_count = serializers.SerializerMethodField()
+    expected_cash = serializers.SerializerMethodField()
+    actual_cash = serializers.SerializerMethodField()
     sales = SaleSerializer(source='sale_set', many=True, read_only=True)
 
     class Meta:
@@ -14,7 +16,7 @@ class ShiftSerializer(serializers.ModelSerializer):
             'id', 'cashier', 'start_time', 'end_time', 'opening_balance',
             'closing_balance', 'cash_sales', 'card_sales', 'mobile_sales',
             'total_sales', 'status', 'discrepancy', 'approved_by',
-            'cashier_name', 'approved_by_name', 'transaction_count', 'sales'
+            'cashier_name', 'approved_by_name', 'transaction_count', 'expected_cash', 'actual_cash', 'notes', 'sales'
         ]
 
     def get_transaction_count(self, obj):
@@ -34,3 +36,9 @@ class ShiftSerializer(serializers.ModelSerializer):
             return obj.approved_by.user.username if obj.approved_by else None
         except:
             return None
+
+    def get_expected_cash(self, obj):
+        return obj.opening_balance + obj.cash_sales
+
+    def get_actual_cash(self, obj):
+        return obj.closing_balance

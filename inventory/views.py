@@ -2,6 +2,17 @@ from rest_framework import viewsets, status
 from rest_framework.generics import ListAPIView
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
+
+class StockMovementPagination(PageNumberPagination):
+    page_size = 5
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+class ProductPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db import models
@@ -23,11 +34,26 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
+    pagination_class = ProductPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['category', 'is_active']
     search_fields = ['sku', 'name', 'description']
     ordering_fields = ['name', 'created_at', 'selling_price']
     ordering = ['name']
+
+    @action(detail=False, methods=['get'])
+    def pos_products(self, request):
+        """Get all products for POS without pagination"""
+        mode = request.query_params.get('mode', 'retail')
+
+        # Get all active products for POS
+        products = Product.objects.filter(is_active=True)
+
+        # Add category information
+        products = products.select_related('category')
+
+        serializer = self.get_serializer(products, many=True, context={'request': request})
+        return Response(serializer.data)
 
 class BatchViewSet(viewsets.ModelViewSet):
     queryset = Batch.objects.all()
@@ -105,6 +131,7 @@ class BatchViewSet(viewsets.ModelViewSet):
 class StockMovementViewSet(viewsets.ModelViewSet):
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer
+    pagination_class = StockMovementPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['movement_type', 'product']
     search_fields = ['product__name', 'reason']
@@ -196,11 +223,22 @@ class SalesHistoryViewSet(viewsets.ModelViewSet):
 class ProductHistoryViewSet(viewsets.ModelViewSet):
     queryset = ProductHistory.objects.all()
     serializer_class = ProductHistorySerializer
+    pagination_class = StockMovementPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['product', 'field_changed', 'change_type', 'user']
     search_fields = ['product__name', 'field_changed', 'notes']
     ordering_fields = ['changed_at']
     ordering = ['-changed_at']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from:
+            queryset = queryset.filter(changed_at__date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(changed_at__date__lte=date_to)
+        return queryset
 
     @action(detail=False, methods=['get'], url_path=r'product/(?P<product_id>\d+)')
     def by_product(self, request, product_id=None):
@@ -392,6 +430,47 @@ class EndOfDayStockView(ListAPIView):
             products = Product.objects.all()
 
         for product in products:
+            # Get all stock changes from ProductHistory
+            stock_changes = list(ProductHistory.objects.filter(
+                product=product,
+                field_changed='stock_quantity'
+            ).order_by('changed_at'))
+
+            # Initialize stock timeline
+            stock_by_date = {}
+            current_date = from_date
+            while current_date <= to_date:
+                stock_by_date[current_date] = product.stock_quantity  # Default to current
+                current_date += timezone.timedelta(days=1)
+
+            # Set initial stock (before any changes)
+            initial_stock = product.stock_quantity
+            if stock_changes and stock_changes[0].old_value:
+                try:
+                    initial_stock = int(float(stock_changes[0].old_value))
+                except (ValueError, TypeError):
+                    pass
+
+            # Set stock for all dates to initial
+            current_date = from_date
+            while current_date <= to_date:
+                stock_by_date[current_date] = initial_stock
+                current_date += timezone.timedelta(days=1)
+
+            # Apply changes forward in time
+            for change in stock_changes:
+                if change.new_value:
+                    try:
+                        new_stock = int(float(change.new_value))
+                        change_date = change.changed_at.date()
+                        # Update from change date onward
+                        current_date = max(change_date, from_date)
+                        while current_date <= to_date:
+                            stock_by_date[current_date] = new_stock
+                            current_date += timezone.timedelta(days=1)
+                    except (ValueError, TypeError):
+                        pass
+
             product_data = {
                 'product_id': product.id,
                 'product_name': product.name,
@@ -401,38 +480,15 @@ class EndOfDayStockView(ListAPIView):
 
             current_stock = product.stock_quantity
 
-            for report_date in reversed(dates):  # Work backwards from today
-                # Get all movements after this date
-                future_movements = StockMovement.objects.filter(
-                    product=product,
-                    created_at__date__gt=report_date
-                )
-
-                future_sales = SalesHistory.objects.filter(
-                    product=product,
-                    sale_date__date__gt=report_date
-                )
-
-                # Calculate stock at end of this day
-                day_end_stock = current_stock
-                for movement in future_movements:
-                    if movement.movement_type == 'in':
-                        day_end_stock -= movement.quantity
-                    elif movement.movement_type == 'out':
-                        day_end_stock += movement.quantity
-                    elif movement.movement_type == 'adjustment':
-                        day_end_stock -= movement.quantity
-
-                for sale in future_sales:
-                    day_end_stock += sale.quantity
+            for report_date in dates:
+                end_of_day_stock = stock_by_date.get(report_date, current_stock)
 
                 product_data['daily_stock'].append({
                     'date': report_date,
-                    'end_of_day_stock': max(0, day_end_stock),  # Ensure non-negative
+                    'end_of_day_stock': max(0, end_of_day_stock),  # Ensure non-negative
                     'current_stock': current_stock
                 })
 
-            product_data['daily_stock'].reverse()  # Back to chronological order
             report_data.append(product_data)
 
         return Response({

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem
+from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem, AuditLog
 
 class CartItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
@@ -32,6 +32,7 @@ class SaleSerializer(serializers.ModelSerializer):
     payment_method = serializers.SerializerMethodField()
     split_data = serializers.SerializerMethodField()
     voided_by_name = serializers.SerializerMethodField()
+    edited_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Sale
@@ -91,6 +92,12 @@ class SaleSerializer(serializers.ModelSerializer):
         except AttributeError:
             return None
 
+    def get_edited_by_name(self, obj):
+        try:
+            return obj.edited_by.user.username if obj.edited_by else None
+        except AttributeError:
+            return None
+
 class ReturnSerializer(serializers.ModelSerializer):
     sale_receipt = serializers.CharField(source='sale.receipt_number', read_only=True)
     processed_by_name = serializers.CharField(source='processed_by.user.username', read_only=True)
@@ -144,3 +151,13 @@ class InvoiceSerializer(serializers.ModelSerializer):
         invoice.save()
 
         return invoice
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.user.username', read_only=True)
+    user_role = serializers.CharField(source='user.role', read_only=True)
+
+    class Meta:
+        model = AuditLog
+        fields = '__all__'
+        read_only_fields = ('id', 'timestamp', 'ip_address', 'user_agent')

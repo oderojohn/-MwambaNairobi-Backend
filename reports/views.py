@@ -457,12 +457,25 @@ class SalesSummaryView(generics.GenericAPIView):
             voided=True
         ).select_related('customer').prefetch_related('saleitem_set__product').order_by('-sale_date')
 
+        # Get voided sales for the shift
+        voided_sales = Sale.objects.filter(
+            shift_id=shift.id,
+            voided=True
+        ).select_related('customer').prefetch_related('saleitem_set__product').order_by('-sale_date')
+
         # Get held orders for the cashier (during this shift period)
         held_orders = Cart.objects.filter(
             cashier=cashier,
             status='held',
-            created_at__gte=shift.start_time
+            created_at__gte=shift.start_time,
+            created_at__lte=shift.end_time or timezone.now()
         ).select_related('customer').prefetch_related('cartitem_set__product').order_by('-created_at')
+
+        # Get voided sales for the shift
+        voided_sales = Sale.objects.filter(
+            shift_id=shift.id,
+            voided=True
+        ).select_related('customer').prefetch_related('saleitem_set__product').order_by('-sale_date')
 
         result = {
             'total_sales': total_sales,
@@ -541,6 +554,280 @@ class SalesSummaryView(generics.GenericAPIView):
 
         return result
 
+    def _get_all_sales_data(self):
+        """Get all sales data (not restricted to a shift)"""
+        from sales.models import Sale, SaleItem
+        from payments.models import Payment
+
+        # Get all completed sales (exclude voided sales for totals)
+        sales = Sale.objects.filter(
+            voided=False
+        ).select_related('customer').prefetch_related('payment_set', 'saleitem_set__product').order_by('-sale_date')[:1000]  # Limit to last 1000 sales for performance
+
+        # Get payment method breakdown
+        payments = Payment.objects.filter(
+            sale__voided=False,
+            status='completed'
+        ).select_related('sale')
+
+        payment_breakdown = {}
+        for payment in payments:
+            payment_type = payment.payment_type
+            amount = float(payment.amount)
+            if payment.payment_type == 'split' and payment.split_data:
+                # For split payments, add amounts to respective methods
+                for method, split_amount in payment.split_data.items():
+                    payment_breakdown[method] = payment_breakdown.get(method, 0) + float(split_amount)
+            else:
+                payment_breakdown[payment_type] = payment_breakdown.get(payment_type, 0) + amount
+
+        # Get total sales and transactions
+        total_sales = sum(float(sale.final_amount) for sale in sales)
+        total_transactions = sales.count()
+
+        # Calculate actual gross profit for all sales
+        gross_profit = 0
+        for sale in sales:
+            for item in sale.saleitem_set.all():
+                if item.product and item.product.cost_price:
+                    profit_per_item = (item.unit_price - item.product.cost_price) * item.quantity
+                    gross_profit += float(profit_per_item)
+
+        # Calculate cost of goods sold
+        cost_of_goods_sold = sum(
+            float(item.product.cost_price * item.quantity)
+            for sale in sales
+            for item in sale.saleitem_set.all()
+            if item.product and item.product.cost_price
+        )
+
+        # Net profit (estimated as gross profit minus 5% operating costs)
+        net_profit = gross_profit * 0.95
+
+        result = {
+            'total_sales': total_sales,
+            'total_transactions': total_transactions,
+            'average_sale': total_sales / total_transactions if total_transactions > 0 else 0,
+            'today_sales': total_sales,  # Since it's all sales
+            'gross_profit': gross_profit,
+            'net_profit': net_profit,
+            'cost_of_goods_sold': cost_of_goods_sold,
+            'sales_by_payment_method': payment_breakdown,
+            'recent_sales': [
+                {
+                    'id': sale.id,
+                    'customer': sale.customer.name if sale.customer else 'Walk-in',
+                    'total_amount': float(sale.total_amount),
+                    'receipt_number': sale.receipt_number,
+                    'created_at': sale.sale_date.isoformat(),
+                    'payment_method': self._determine_payment_method(sale),
+                    'sale_type': sale.sale_type,
+                    'mpesa_number': sale.payment_set.filter(payment_type='mpesa', status='completed').first().mpesa_number if sale.payment_set.filter(payment_type='mpesa', status='completed').exists() else None,
+                    'items': [
+                        {
+                            'product_name': item.product.name,
+                            'quantity': item.quantity,
+                            'unit_price': float(item.unit_price),
+                            'total': float(item.unit_price * item.quantity)
+                        }
+                        for item in sale.saleitem_set.all()
+                    ],
+                    'split_data': self._get_split_data_for_sale(sale)
+                }
+                for sale in sales
+            ]
+        }
+
+        return result
+
+    def _get_all_shifts_data(self, date_from=None, date_to=None):
+        """Get summary data for all shifts, optionally filtered by date range"""
+        from shifts.models import Shift
+        from sales.models import Sale, SaleItem, Cart
+        from payments.models import Payment
+
+        # Build queryset for shifts
+        shifts_query = Shift.objects.select_related('cashier__user').order_by('-start_time')
+
+        # Only filter by date if dates are provided
+        if date_from and date_to:
+            shifts_query = shifts_query.filter(start_time__date__range=[date_from, date_to])
+        elif date_from:
+            shifts_query = shifts_query.filter(start_time__date__gte=date_from)
+        elif date_to:
+            shifts_query = shifts_query.filter(start_time__date__lte=date_to)
+
+        # Limit to recent shifts for performance
+        shifts = shifts_query[:500]
+
+        shift_summaries = []
+        total_sales = 0
+        total_transactions = 0
+        total_gross_profit = 0
+        total_cost_of_goods_sold = 0
+
+        payment_breakdown = {}
+
+        for shift in shifts:
+            # Get sales for this shift
+            shift_sales = Sale.objects.filter(
+                shift_id=shift.id,
+                voided=False
+            ).select_related('customer').prefetch_related('payment_set', 'saleitem_set__product')
+
+            # Get voided sales for this shift
+            voided_sales = Sale.objects.filter(
+                shift_id=shift.id,
+                voided=True
+            ).select_related('customer').prefetch_related('saleitem_set__product')
+
+            # Get held orders for this shift
+            held_orders = Cart.objects.filter(
+                cashier=shift.cashier,
+                status='held',
+                created_at__gte=shift.start_time,
+                created_at__lte=shift.end_time or timezone.now()
+            ).select_related('customer').prefetch_related('cartitem_set__product')
+
+            if not shift_sales.exists():
+                continue
+
+            # Calculate shift totals
+            shift_total_sales = sum(float(sale.final_amount) for sale in shift_sales)
+            shift_transactions = shift_sales.count()
+
+            # Calculate gross profit for shift
+            shift_gross_profit = 0
+            shift_cost_of_goods_sold = 0
+            for sale in shift_sales:
+                for item in sale.saleitem_set.all():
+                    if item.product and item.product.cost_price:
+                        profit_per_item = (item.unit_price - item.product.cost_price) * item.quantity
+                        shift_gross_profit += float(profit_per_item)
+                        shift_cost_of_goods_sold += float(item.product.cost_price * item.quantity)
+
+            # Get payment breakdown for shift
+            shift_payments = Payment.objects.filter(
+                sale__shift_id=shift.id,
+                sale__voided=False,
+                status='completed'
+            )
+
+            shift_payment_breakdown = {}
+            for payment in shift_payments:
+                payment_type = payment.payment_type
+                amount = float(payment.amount)
+                if payment.payment_type == 'split' and payment.split_data:
+                    for method, split_amount in payment.split_data.items():
+                        shift_payment_breakdown[method] = shift_payment_breakdown.get(method, 0) + float(split_amount)
+                else:
+                    shift_payment_breakdown[payment_type] = shift_payment_breakdown.get(payment_type, 0) + amount
+
+            # Add to overall totals
+            total_sales += shift_total_sales
+            total_transactions += shift_transactions
+            total_gross_profit += shift_gross_profit
+            total_cost_of_goods_sold += shift_cost_of_goods_sold
+
+            for method, amount in shift_payment_breakdown.items():
+                payment_breakdown[method] = payment_breakdown.get(method, 0) + amount
+
+            shift_summaries.append({
+                'shift_id': shift.id,
+                'cashier': shift.cashier.user.username if shift.cashier else 'Unknown',
+                'start_time': shift.start_time.isoformat(),
+                'end_time': shift.end_time.isoformat() if shift.end_time else None,
+                'status': shift.status,
+                'total_sales': shift_total_sales,
+                'total_transactions': shift_transactions,
+                'average_sale': shift_total_sales / shift_transactions if shift_transactions > 0 else 0,
+                'gross_profit': shift_gross_profit,
+                'net_profit': shift_gross_profit * 0.95,  # Estimated
+                'cost_of_goods_sold': shift_cost_of_goods_sold,
+                'opening_cash': float(shift.opening_balance) if shift.opening_balance else 0,
+                'closing_cash': float(shift.closing_balance) if shift.closing_balance else 0,
+                'variance': float(shift.discrepancy) if shift.discrepancy else 0,
+                'payment_methods': shift_payment_breakdown,
+                'sales': [
+                    {
+                        'id': sale.id,
+                        'customer': sale.customer.name if sale.customer else 'Walk-in',
+                        'total_amount': float(sale.total_amount),
+                        'receipt_number': sale.receipt_number,
+                        'created_at': sale.sale_date.isoformat(),
+                        'payment_method': self._determine_payment_method(sale),
+                        'sale_type': sale.sale_type,
+                        'items': [
+                            {
+                                'product_name': item.product.name,
+                                'quantity': item.quantity,
+                                'unit_price': float(item.unit_price),
+                                'total': float(item.unit_price * item.quantity)
+                            }
+                            for item in sale.saleitem_set.all()
+                        ],
+                        'split_data': self._get_split_data_for_sale(sale)
+                    }
+                    for sale in shift_sales
+                ],
+                'voided_sales': [
+                    {
+                        'id': sale.id,
+                        'customer': sale.customer.name if sale.customer else 'Walk-in',
+                        'total_amount': float(sale.total_amount),
+                        'receipt_number': sale.receipt_number,
+                        'created_at': sale.sale_date.isoformat(),
+                        'void_reason': sale.void_reason,
+                        'voided_at': sale.voided_at.isoformat() if sale.voided_at else None,
+                        'items': [
+                            {
+                                'product_name': item.product.name,
+                                'quantity': item.quantity,
+                                'unit_price': float(item.unit_price),
+                                'total': float(item.unit_price * item.quantity)
+                            }
+                            for item in sale.saleitem_set.all()
+                        ]
+                    }
+                    for sale in voided_sales
+                ],
+                'held_orders': [
+                    {
+                        'id': cart.id,
+                        'customer': cart.customer.name if cart.customer else 'Walk-in',
+                        'total_amount': float(sum(item.unit_price * item.quantity for item in cart.cartitem_set.all())),
+                        'created_at': cart.created_at.isoformat(),
+                        'status': cart.status,
+                        'void_reason': cart.void_reason,
+                        'items': [
+                            {
+                                'product_name': item.product.name,
+                                'quantity': item.quantity,
+                                'unit_price': float(item.unit_price),
+                                'total': float(item.unit_price * item.quantity)
+                            }
+                            for item in cart.cartitem_set.all()
+                        ]
+                    }
+                    for cart in held_orders
+                ]
+            })
+
+        result = {
+            'total_sales': total_sales,
+            'total_transactions': total_transactions,
+            'average_sale': total_sales / total_transactions if total_transactions > 0 else 0,
+            'today_sales': total_sales,  # For compatibility
+            'gross_profit': total_gross_profit,
+            'net_profit': total_gross_profit * 0.95,
+            'cost_of_goods_sold': total_cost_of_goods_sold,
+            'sales_by_payment_method': payment_breakdown,
+            'shifts': shift_summaries,
+            'recent_sales': []  # Keep for compatibility, but empty since we're showing shifts
+        }
+
+        return result
+
     def get(self, request, sale_id=None):
         # Check if this is a request for a specific sale chit
         if sale_id:
@@ -605,6 +892,16 @@ class SalesSummaryView(generics.GenericAPIView):
                     return Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
             daily_summary = self._get_daily_sales_summary(date)
             return Response(daily_summary)
+
+        # Check if all_shifts is requested
+        all_shifts = request.query_params.get('all_shifts')
+
+        if all_shifts:
+            # Return all shifts summary data
+            date_from = request.query_params.get('date_from')
+            date_to = request.query_params.get('date_to')
+            sales_data = self._get_all_shifts_data(date_from, date_to)
+            return Response(sales_data)
 
         # Check if shift_id is provided (for shift-specific sales summary)
         shift_id = request.query_params.get('shift_id')
@@ -1518,10 +1815,10 @@ class InventorySummaryView(generics.GenericAPIView):
             from inventory.models import StockMovement
             from django.db.models.functions import TruncWeek
 
-            # Get stock movements for the last 12 weeks
-            twelve_weeks_ago = timezone.now() - timedelta(weeks=12)
+            # Get stock movements for the last 5 weeks
+            five_weeks_ago = timezone.now() - timedelta(weeks=5)
             stock_movements = StockMovement.objects.filter(
-                created_at__gte=twelve_weeks_ago
+                created_at__gte=five_weeks_ago
             ).annotate(
                 week=TruncWeek('created_at')
             ).values('week', 'product__category__name').annotate(
@@ -1544,12 +1841,12 @@ class InventorySummaryView(generics.GenericAPIView):
 
                 movement_by_week[week_key][category_name] = abs(movement['total_movement'])
 
-            # Create chart data with all categories for the last 12 weeks
+            # Create chart data with all categories for the last 5 weeks
             stock_movement_data = []
             current_date = timezone.now().date()
 
-            for i in range(12):
-                week_start = current_date - timedelta(weeks=11-i)
+            for i in range(5):
+                week_start = current_date - timedelta(weeks=4-i)
                 week_key = f"Week of {week_start.strftime('%Y-%m-%d')}"
                 week_data = {'week': week_key}
                 for category in categories:

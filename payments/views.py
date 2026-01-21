@@ -1,11 +1,13 @@
 from rest_framework import viewsets, status
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from .models import Payment, PaymentLog, InstallmentPlan
 from .serializers import PaymentSerializer, PaymentLogSerializer, InstallmentPlanSerializer
 
 class PaymentViewSet(viewsets.ModelViewSet):
     queryset = Payment.objects.all()
     serializer_class = PaymentSerializer
+    pagination_class = PageNumberPagination
 
     def create(self, request, *args, **kwargs):
         """

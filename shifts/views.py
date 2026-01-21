@@ -1,5 +1,6 @@
 from rest_framework import viewsets, generics, status
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
@@ -9,6 +10,7 @@ from .serializers import ShiftSerializer
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
+    pagination_class = PageNumberPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['cashier', 'status', 'start_time', 'end_time']
     search_fields = ['cashier__user__username', 'cashier__user__first_name', 'cashier__user__last_name']
@@ -176,6 +178,7 @@ class CurrentShiftView(generics.GenericAPIView):
 
 class AllShiftsView(generics.ListAPIView):
     serializer_class = ShiftSerializer
+    pagination_class = PageNumberPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['cashier', 'status', 'start_time', 'end_time']
     search_fields = ['cashier__user__username', 'cashier__user__first_name', 'cashier__user__last_name']
