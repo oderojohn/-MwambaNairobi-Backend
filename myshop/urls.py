@@ -18,7 +18,6 @@ from django.contrib import admin
 from django.urls import path, include
 from suppliers.views import SupplierPriceHistoryViewSet
 from inventory.views import ProductViewSet
-from suppliers.views import SupplierViewSet
 from customers.views import CustomerViewSet
 from repairs.views import RepairViewSet
 from preorders.views import PreorderViewSet
@@ -32,8 +31,6 @@ urlpatterns = [
     path('api/roles/', include('users.urls')),
     path('api/products/', ProductViewSet.as_view({'get': 'list', 'post': 'create'})),
     path('api/products/<int:pk>/', ProductViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
-    path('api/suppliers/', SupplierViewSet.as_view({'get': 'list', 'post': 'create'})),
-    path('api/suppliers/<int:pk>/', SupplierViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
     path('api/', include('sales.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/customers/', include('customers.urls')),
