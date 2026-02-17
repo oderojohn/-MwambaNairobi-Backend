@@ -46,12 +46,20 @@ class PurchaseOrder(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.order_number:
-            # Generate unique order number using timestamp and random component
-            import uuid
-            from django.utils import timezone
-            timestamp = timezone.now().strftime('%Y%m%d%H%M%S')
-            unique_id = str(uuid.uuid4())[:4].upper()
-            self.order_number = f"PO{timestamp}{unique_id}"
+            # Generate simple sequential order number
+            last_order = PurchaseOrder.objects.order_by('-id').first()
+            if last_order:
+                # Extract the numeric part from last order number
+                try:
+                    last_num = int(last_order.order_number.replace('PO', ''))
+                    new_num = last_num + 1
+                except ValueError:
+                    # If parsing fails, start from 1
+                    new_num = 1
+            else:
+                new_num = 1
+            # Pad with zeros (001, 002, etc.)
+            self.order_number = f"PO{new_num:03d}"
         super().save(*args, **kwargs)
 
     def update_status(self):

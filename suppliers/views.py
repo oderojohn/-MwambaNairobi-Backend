@@ -24,14 +24,14 @@ class SupplierPriceHistoryViewSet(viewsets.ModelViewSet):
     ordering = ['-date']
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
-    queryset = PurchaseOrder.objects.all()
+    queryset = PurchaseOrder.objects.all().order_by('-created_at')
     serializer_class = PurchaseOrderSerializer
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['supplier', 'status']
     search_fields = ['order_number', 'supplier__name']
-    ordering_fields = ['order_date', 'expected_delivery_date']
-    ordering = ['-order_date']
-    http_method_names = ['get', 'post', 'put', 'patch', 'delete']  # Explicitly allow PATCH
+    ordering_fields = ['order_date', 'expected_delivery_date', 'created_at']
+    ordering = ['-created_at']  # Most recent first
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete']
 
     def partial_update(self, request, *args, **kwargs):
         """Handle PATCH requests for partial updates"""
@@ -68,12 +68,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             status='ordered'
         )
 
-        # Receive the batch (adds to stock)
+        # Receive the batch (adds to stock and updates received_quantity)
         batch.receive_batch()
-
-        # Update the purchase order item's received quantity
-        item.received_quantity += quantity
-        item.save()
 
         return Response({'message': 'Batch received successfully', 'batch_id': batch.id})
 

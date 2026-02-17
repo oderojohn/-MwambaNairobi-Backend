@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem, AuditLog
+from .models import Cart, CartItem, Sale, SaleItem, Return, ReturnItem, Invoice, InvoiceItem, AuditLog, ExchangeItem
 
 class CartItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
@@ -21,13 +21,16 @@ class CartSerializer(serializers.ModelSerializer):
 
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
+    returned_quantity = serializers.IntegerField(read_only=True)
+    remaining_quantity = serializers.IntegerField(read_only=True)
+    is_fully_returned = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = SaleItem
         fields = '__all__'
 
 class SaleSerializer(serializers.ModelSerializer):
-    items = SaleItemSerializer(many=True, read_only=True)
+    items = serializers.SerializerMethodField()
     customer_name = serializers.SerializerMethodField()
     payment_method = serializers.SerializerMethodField()
     split_data = serializers.SerializerMethodField()
@@ -36,7 +39,29 @@ class SaleSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Sale
-        fields = '__all__'
+        fields = ['id', 'customer', 'customer_name', 'shift', 'sale_type', 'total_amount', 
+                  'tax_amount', 'discount_amount', 'final_amount', 'sale_date', 
+                  'receipt_number', 'return_code_used', 'return_code_amount',
+                  'voided', 'void_reason', 'voided_at', 'voided_by', 
+                  'edit_reason', 'edited_at', 'edited_by', 'payment_method', 'split_data', 
+                  'voided_by_name', 'edited_by_name', 'items', 'cart']
+    
+    def get_items(self, obj):
+        items = list(obj.saleitem_set.all())
+        
+        return [
+            {
+                'id': item.id,
+                'product': item.product.id if item.product else None,
+                'product_name': item.product.name if item.product else None,
+                'quantity': item.quantity,
+                'quantity_returned': 0,
+                'quantity_remaining': item.quantity,
+                'unit_price': str(item.unit_price),
+                'discount': str(item.discount)
+            }
+            for item in items
+        ]
 
     def get_customer_name(self, obj):
         try:
@@ -101,10 +126,61 @@ class SaleSerializer(serializers.ModelSerializer):
 class ReturnSerializer(serializers.ModelSerializer):
     sale_receipt = serializers.CharField(source='sale.receipt_number', read_only=True)
     processed_by_name = serializers.CharField(source='processed_by.user.username', read_only=True)
+    items = serializers.SerializerMethodField()
+    exchange_items = serializers.SerializerMethodField()
+    return_code = serializers.SerializerMethodField()
+    # Add aliases for frontend compatibility
+    created_at = serializers.DateTimeField(source='return_date', read_only=True)
+    total_amount = serializers.DecimalField(source='total_refund_amount', max_digits=10, decimal_places=2, read_only=True)
+    returned_by_name = serializers.CharField(source='processed_by.user.username', read_only=True)
 
     class Meta:
         model = Return
         fields = '__all__'
+
+    def get_items(self, obj):
+        return ReturnItemSerializer(obj.items.all(), many=True).data
+
+    def get_exchange_items(self, obj):
+        # Return empty list if exchange_items doesn't exist
+        if hasattr(obj, 'exchange_items'):
+            return ExchangeItemSerializer(obj.exchange_items.all(), many=True).data
+        return []
+    
+    def get_return_code(self, obj):
+        # Return code functionality not implemented
+        return None
+
+
+class ReturnItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='sale_item.product.name', read_only=True)
+    unit_price = serializers.DecimalField(source='sale_item.unit_price', max_digits=10, decimal_places=2, read_only=True)
+    quantity = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ReturnItem
+        fields = '__all__'
+
+
+class ExchangeItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+
+    class Meta:
+        model = ExchangeItem
+        fields = '__all__'
+
+
+class ValidateReturnCodeSerializer(serializers.Serializer):
+    """Serializer for validating return codes"""
+    code = serializers.CharField(max_length=12)
+    expected_amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
+
+
+class GenerateReturnCodeSerializer(serializers.Serializer):
+    """Serializer for generating return codes"""
+    return_record_id = serializers.IntegerField()
+    refund_amount = serializers.DecimalField(max_digits=10, decimal_places=2)
+
 
 class InvoiceItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)

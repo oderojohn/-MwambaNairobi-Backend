@@ -498,10 +498,14 @@ class SalesSummaryView(generics.GenericAPIView):
                     'mpesa_number': sale.payment_set.filter(payment_type='mpesa', status='completed').first().mpesa_number if sale.payment_set.filter(payment_type='mpesa', status='completed').exists() else None,
                     'items': [
                         {
+                            'id': item.id,
                             'product_name': item.product.name,
                             'quantity': item.quantity,
                             'unit_price': float(item.unit_price),
-                            'total': float(item.unit_price * item.quantity)
+                            'total': float(item.unit_price * item.quantity),
+                            'returned_quantity': item.returned_quantity,
+                            'remaining_quantity': item.remaining_quantity,
+                            'is_fully_returned': item.is_fully_returned
                         }
                         for item in sale.saleitem_set.all()
                     ],
@@ -643,7 +647,7 @@ class SalesSummaryView(generics.GenericAPIView):
     def _get_all_shifts_data(self, date_from=None, date_to=None):
         """Get summary data for all shifts, optionally filtered by date range"""
         from shifts.models import Shift
-        from sales.models import Sale, SaleItem, Cart
+        from sales.models import Sale, SaleItem, Cart, Return
         from payments.models import Payment
 
         # Build queryset for shifts
@@ -663,6 +667,8 @@ class SalesSummaryView(generics.GenericAPIView):
         shift_summaries = []
         total_sales = 0
         total_transactions = 0
+        total_returns = 0
+        total_return_count = 0
         total_gross_profit = 0
         total_cost_of_goods_sold = 0
 
@@ -681,6 +687,12 @@ class SalesSummaryView(generics.GenericAPIView):
                 voided=True
             ).select_related('customer').prefetch_related('saleitem_set__product')
 
+            # Get returns for this shift (filter by return's shift to show returns processed during this shift)
+            shift_returns = Return.objects.filter(
+                shift_id=shift.id,
+                sale__voided=False
+            ).select_related('sale', 'processed_by__user').prefetch_related('items__sale_item__product')
+
             # Get held orders for this shift
             held_orders = Cart.objects.filter(
                 cashier=shift.cashier,
@@ -695,6 +707,10 @@ class SalesSummaryView(generics.GenericAPIView):
             # Calculate shift totals
             shift_total_sales = sum(float(sale.final_amount) for sale in shift_sales)
             shift_transactions = shift_sales.count()
+
+            # Calculate shift returns
+            shift_total_returns = sum(float(ret.total_refund_amount) for ret in shift_returns)
+            shift_return_count = shift_returns.count()
 
             # Calculate gross profit for shift
             shift_gross_profit = 0
@@ -726,6 +742,8 @@ class SalesSummaryView(generics.GenericAPIView):
             # Add to overall totals
             total_sales += shift_total_sales
             total_transactions += shift_transactions
+            total_returns += shift_total_returns
+            total_return_count += shift_return_count
             total_gross_profit += shift_gross_profit
             total_cost_of_goods_sold += shift_cost_of_goods_sold
 
@@ -739,14 +757,19 @@ class SalesSummaryView(generics.GenericAPIView):
                 'end_time': shift.end_time.isoformat() if shift.end_time else None,
                 'status': shift.status,
                 'total_sales': shift_total_sales,
+                'total_returns': shift_total_returns,
+                'return_count': shift_return_count,
+                'net_sales': shift_total_sales - shift_total_returns,
                 'total_transactions': shift_transactions,
                 'average_sale': shift_total_sales / shift_transactions if shift_transactions > 0 else 0,
                 'gross_profit': shift_gross_profit,
                 'net_profit': shift_gross_profit * 0.95,  # Estimated
                 'cost_of_goods_sold': shift_cost_of_goods_sold,
-                'opening_cash': float(shift.opening_balance) if shift.opening_balance else 0,
-                'closing_cash': float(shift.closing_balance) if shift.closing_balance else 0,
-                'variance': float(shift.discrepancy) if shift.discrepancy else 0,
+                'opening_cash': float(shift.opening_balance) if shift.opening_balance is not None else 0,
+                'closing_cash': float(shift.closing_balance) if shift.closing_balance is not None else 0,
+                # Calculate variance: actual - expected (considering returns)
+                # Positive = overage, Negative = shortage
+                'variance': (float(shift.closing_balance or 0) - (float(shift.opening_balance or 0) + float(shift.cash_sales or 0) - float(shift.total_returns or 0))) if shift.closing_balance is not None else 0,
                 'payment_methods': shift_payment_breakdown,
                 'sales': [
                     {
@@ -769,6 +792,27 @@ class SalesSummaryView(generics.GenericAPIView):
                         'split_data': self._get_split_data_for_sale(sale)
                     }
                     for sale in shift_sales
+                ],
+                'returns': [
+                    {
+                        'id': ret.id,
+                        'receipt_number': ret.receipt_number,
+                        'sale_receipt': ret.sale.receipt_number if ret.sale else None,
+                        'return_date': ret.return_date.isoformat() if ret.return_date else None,
+                        'total_refund_amount': float(ret.total_refund_amount) if ret.total_refund_amount else 0,
+                        'return_type': ret.return_type,
+                        'reason': ret.reason,
+                        'processed_by_name': ret.processed_by.user.username if ret.processed_by else None,
+                        'items': [
+                            {
+                                'product_name': item.sale_item.product.name if item.sale_item and item.sale_item.product else 'Unknown',
+                                'quantity': item.quantity,
+                                'refund_amount': float(item.refund_amount) if item.refund_amount else 0
+                            }
+                            for item in ret.items.all()
+                        ]
+                    }
+                    for ret in shift_returns
                 ],
                 'voided_sales': [
                     {
@@ -815,6 +859,9 @@ class SalesSummaryView(generics.GenericAPIView):
 
         result = {
             'total_sales': total_sales,
+            'total_returns': total_returns,
+            'total_return_count': total_return_count,
+            'net_sales': total_sales - total_returns,
             'total_transactions': total_transactions,
             'average_sale': total_sales / total_transactions if total_transactions > 0 else 0,
             'today_sales': total_sales,  # For compatibility
@@ -953,7 +1000,11 @@ class SalesSummaryView(generics.GenericAPIView):
             today_sales = self._get_today_sales()
 
             # Total sales
-            total_sales = self._get_total_sales()
+            total_sales_data = self._get_total_sales()
+            total_sales = total_sales_data['total']
+            total_cost = total_sales_data.get('total_cost', 0)
+            gross_profit = total_sales_data.get('gross_profit', 0)
+            net_profit = total_sales_data.get('net_profit', 0)
 
             # Sales data for chart (last 7 days)
             sales_data = self._get_sales_trend_data(week_ago, today)
@@ -967,13 +1018,20 @@ class SalesSummaryView(generics.GenericAPIView):
             # Recent transactions
             recent_transactions = self._get_recent_transactions()
 
+            # Returns data
+            returns_data = self._get_returns_data()
+
             data = {
                 'today_sales': today_sales,
                 'total_sales': total_sales,
+                'total_cost': total_cost,
+                'gross_profit': gross_profit,
+                'net_profit': net_profit,
                 'sales_data': sales_data,
                 'payment_methods': payment_methods,
                 'top_products': top_products,
-                'recent_transactions': recent_transactions
+                'recent_transactions': recent_transactions,
+                'returns_data': returns_data
             }
 
             serializer = SalesSummarySerializer(data)
@@ -1031,9 +1089,38 @@ class SalesSummaryView(generics.GenericAPIView):
         return float(today_sales)
 
     def _get_total_sales(self):
-        from sales.models import Sale
+        from sales.models import Sale, SaleItem
+        from django.db.models import Sum
+        from decimal import Decimal
+        
         total_sales = Sale.objects.aggregate(total=Sum('final_amount'))['total'] or Decimal('0')
-        return float(total_sales)
+        total_sales = float(total_sales)
+        
+        # Calculate cost of goods sold and gross profit from sale items using REAL data
+        sales_items = SaleItem.objects.filter(
+            sale__voided=False
+        ).select_related('product')
+        
+        total_cost = 0
+        gross_profit = 0
+        
+        for item in sales_items:
+            if item.product and item.product.cost_price:
+                # Real calculation: (selling_price - cost_price) * quantity
+                cost = float(item.product.cost_price) * item.quantity
+                revenue = float(item.unit_price) * item.quantity
+                total_cost += cost
+                gross_profit += (revenue - cost)
+        
+        # If no cost data, profit is 0
+        net_profit = gross_profit * 0.95 if gross_profit > 0 else 0
+        
+        return {
+            'total': total_sales,
+            'total_cost': total_cost,
+            'gross_profit': gross_profit,
+            'net_profit': net_profit
+        }
 
     def _get_sales_trend_data(self, start_date, end_date):
         from sales.models import Sale
@@ -1217,6 +1304,53 @@ class SalesSummaryView(generics.GenericAPIView):
             }
             for sale in recent_sales
         ]
+
+    def _get_returns_data(self):
+        """Get returns data for the dashboard"""
+        from sales.models import Return
+
+        today = timezone.now().date()
+
+        # Today's returns
+        today_returns = Return.objects.filter(return_date__date=today)
+        today_returns_count = today_returns.count()
+        today_returns_total = sum(float(r.total_refund_amount) for r in today_returns)
+
+        # Today's exchanges
+        today_exchanges = today_returns.filter(return_type='exchange')
+        today_exchanges_count = today_exchanges.count()
+
+        # Recent returns (last 5)
+        recent_returns = Return.objects.order_by('-return_date')[:5]
+
+        # By return type
+        returns_by_type = {}
+        for return_type, label in [('full_return', 'Full Return'), ('partial_return', 'Partial Return'), ('exchange', 'Exchange')]:
+            count = Return.objects.filter(return_type=return_type, return_date__date=today).count()
+            returns_by_type[label] = count
+
+        # Top return reasons
+        return_reasons = Return.objects.filter(return_date__date=today).values('reason').annotate(
+            count=Count('id')
+        ).order_by('-count')[:3]
+
+        return {
+            'today_returns_count': today_returns_count,
+            'today_returns_total': float(today_returns_total),
+            'today_exchanges_count': today_exchanges_count,
+            'returns_by_type': returns_by_type,
+            'top_return_reasons': [r['reason'][:30] for r in return_reasons],
+            'recent_returns': [
+                {
+                    'id': ret.id,
+                    'receipt_number': ret.sale.receipt_number,
+                    'refund_amount': float(ret.total_refund_amount),
+                    'return_type': ret.return_type,
+                    'date': ret.return_date.strftime('%H:%M')
+                }
+                for ret in recent_returns
+            ]
+        }
 
     def _get_sales_data_for_range(self, date_from, date_to):
         """Get sales data for the specified date range (for reports)"""
@@ -2285,10 +2419,137 @@ class ShiftSummaryView(generics.GenericAPIView):
                 'shift_date': shift.end_time.date().strftime('%Y-%m-%d'),
                 'start_time': shift.start_time.strftime('%H:%M') if shift.start_time else 'N/A',
                 'end_time': shift.end_time.strftime('%H:%M') if shift.end_time else 'N/A',
-                'opening_balance': float(shift.opening_balance),
-                'closing_balance': float(shift.closing_balance),
-                'total_sales': float(shift.total_sales),
-                'discrepancy': float(shift.discrepancy) if shift.discrepancy else 0,
+                'opening_balance': float(shift.opening_balance) if shift.opening_balance is not None else 0,
+                'closing_balance': float(shift.closing_balance) if shift.closing_balance is not None else 0,
+                'total_sales': float(shift.total_sales) if shift.total_sales is not None else 0,
+                'discrepancy': float(shift.discrepancy) if shift.discrepancy is not None else 0,
+                'expected_cash': float(shift.opening_balance or 0) + float(shift.cash_sales or 0),
+                'actual_cash': float(shift.closing_balance or 0) if shift.closing_balance is not None else 0,
             })
 
         return result
+
+
+class ReturnsSummaryView(generics.GenericAPIView):
+    """Get returns summary for reports"""
+
+    def get(self, request):
+        """Get returns summary data"""
+        from sales.models import Return
+        from shifts.models import Shift
+        from django.db.models import Count, Sum
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        # Date range parameters
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        shift_id = request.query_params.get('shift_id')
+        user_id = request.query_params.get('user_id')
+        
+        # Build queryset
+        returns_query = Return.objects.all()
+        
+        # If shift_id is provided, filter by the return's shift (when return was processed)
+        if shift_id:
+            try:
+                shift = Shift.objects.get(id=shift_id)
+                # Filter by return's shift only (when return was processed, not when sale was made)
+                returns_query = returns_query.filter(shift_id=shift_id)
+            except Shift.DoesNotExist:
+                returns_query = returns_query.none()
+        elif user_id:
+            # Filter by current open shift for this user
+            try:
+                from users.models import UserProfile
+                cashier = UserProfile.objects.get(id=user_id)
+                current_shift = Shift.objects.filter(
+                    cashier=cashier,
+                    status='open'
+                ).first()
+                if current_shift:
+                    returns_query = returns_query.filter(shift_id=current_shift.id)
+                else:
+                    # No open shift, show empty
+                    returns_query = returns_query.none()
+            except UserProfile.DoesNotExist:
+                returns_query = returns_query.none()
+        elif date_from and date_to:
+            returns_query = returns_query.filter(return_date__date__range=[date_from, date_to])
+        else:
+            # Default: filter by today's date
+            today = timezone.now().date()
+            returns_query = returns_query.filter(return_date__date=today)
+        
+        # Summary statistics
+        total_returns = returns_query.count()
+        total_refund_amount = sum(float(r.total_refund_amount) for r in returns_query)
+        total_exchanges = returns_query.filter(return_type='exchange').count()
+        total_new_items_value = 0  # Simplified - no per-item tracking
+        
+        # By return type
+        by_type = {}
+        for rt, label in [('full_return', 'Full Return'), ('partial_return', 'Partial Return'), ('exchange', 'Exchange')]:
+            count = returns_query.filter(return_type=rt).count()
+            amount = sum(float(r.total_refund_amount) for r in returns_query.filter(return_type=rt))
+            by_type[label] = {'count': count, 'amount': float(amount)}
+        
+        # Recent returns
+        recent_returns = returns_query.prefetch_related(
+            'items__sale_item__product'
+        ).order_by('-return_date')[:20]
+        
+        # Recent returns
+        recent_returns_data = []
+        for ret in recent_returns:
+            # Get return items with product details
+            items_data = []
+            for item in ret.items.all():
+                items_data.append({
+                    'product_name': item.sale_item.product.name if item.sale_item and item.sale_item.product else 'Unknown',
+                    'quantity': item.quantity,
+                    'unit_price': float(item.sale_item.unit_price) if item.sale_item else 0,
+                    'refund_amount': float(item.refund_amount),
+                    'reason': item.reason
+                })
+            
+            return_data = {
+                'id': ret.id,
+                'receipt_number': ret.receipt_number,
+                'original_sale': ret.sale.receipt_number if ret.sale else 'N/A',
+                'return_type': ret.return_type,
+                'refund_amount': float(ret.total_refund_amount),
+                'reason': ret.reason[:50] if ret.reason else 'N/A',
+                'processed_by': ret.processed_by.user.username if ret.processed_by else 'N/A',
+                'date': ret.return_date.isoformat(),
+                'items': items_data
+            }
+            recent_returns_data.append(return_data)
+        
+        # Daily trend (last 7 days)
+        daily_trend = []
+        for i in range(7):
+            day = timezone.now().date() - timedelta(days=i)
+            day_returns = returns_query.filter(return_date__date=day)
+            daily_trend.append({
+                'date': day.strftime('%Y-%m-%d'),
+                'count': day_returns.count(),
+                'total_refund': sum(float(r.total_refund_amount) for r in day_returns)
+            })
+        
+        # Top reasons
+        top_reasons = returns_query.values('reason').annotate(
+            count=Count('id')
+        ).order_by('-count')[:5]
+        
+        return Response({
+            'summary': {
+                'total_returns': total_returns,
+                'total_refund_amount': float(total_refund_amount),
+                'total_exchanges': total_exchanges,
+            },
+            'by_type': by_type,
+            'daily_trend': list(reversed(daily_trend)),
+            'top_reasons': [{'reason': r['reason'][:50], 'count': r['count']} for r in top_reasons],
+            'recent_returns': recent_returns_data
+        })

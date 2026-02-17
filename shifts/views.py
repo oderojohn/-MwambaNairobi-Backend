@@ -1,14 +1,20 @@
-from rest_framework import viewsets, generics, status
+from rest_framework import viewsets, generics, status, serializers
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+from django.db.models import Prefetch
+import logging
+logger = logging.getLogger(__name__)
 from .models import Shift
 from .serializers import ShiftSerializer
+from sales.models import Sale
 
 class ShiftViewSet(viewsets.ModelViewSet):
-    queryset = Shift.objects.all()
+    queryset = Shift.objects.prefetch_related(
+        Prefetch('sale_set', queryset=Sale.objects.select_related('customer'))
+    ).select_related('cashier', 'cashier__user', 'approved_by')
     serializer_class = ShiftSerializer
     pagination_class = PageNumberPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -16,185 +22,441 @@ class ShiftViewSet(viewsets.ModelViewSet):
     search_fields = ['cashier__user__username', 'cashier__user__first_name', 'cashier__user__last_name']
     ordering_fields = ['start_time', 'end_time', 'total_sales', 'transaction_count']
     ordering = ['-start_time']
-
-class StartShiftView(generics.CreateAPIView):
-    serializer_class = ShiftSerializer
-
-    def create(self, request, *args, **kwargs):
-        # Get or create user profile for authenticated user
-        from users.models import UserProfile
-        user_profile, created = UserProfile.objects.get_or_create(
-            user=request.user,
-            defaults={'role': 'cashier'}
-        )
-
-        cashier = user_profile
-        # Frontend sends 'starting_cash', backend expects 'opening_balance'
-        opening_balance = request.data.get('starting_cash', 0)
-
-        # Check if there's an open shift
-        existing_shift = Shift.objects.filter(cashier=cashier, status='open').first()
-        if existing_shift:
-            return Response({'error': 'Shift already open'}, status=status.HTTP_400_BAD_REQUEST)
-        shift = Shift.objects.create(cashier=cashier, opening_balance=opening_balance)
-        serializer = self.get_serializer(shift)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-class EndShiftView(generics.CreateAPIView):
-    serializer_class = ShiftSerializer
-
-    def create(self, request, *args, **kwargs):
-        from users.models import UserProfile
-        try:
-            user_profile = request.user.userprofile
-        except UserProfile.DoesNotExist:
-            user_profile = UserProfile.objects.create(
-                user=request.user,
-                role='cashier'
-            )
-
-        cashier = user_profile
-        # Frontend sends 'ending_cash', backend expects 'closing_balance'
-        closing_balance = float(request.data.get('ending_cash', 0))
-
-        try:
-            shift = Shift.objects.get(cashier=cashier, status='open')
-            print(f"EndShiftView: Found open shift {shift.id} for user {cashier.user.username}")
-        except Shift.DoesNotExist:
-            print(f"EndShiftView: No open shift found for user {cashier.user.username}")
-            return Response({
-                'error': '❌ No Active Shift',
-                'message': 'You do not have an active shift to end.',
-                'details': 'Please start a shift first before attempting to end it.',
-                'action_required': 'Start a shift first'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            print(f"EndShiftView: Error finding shift: {str(e)}")
-            return Response({
-                'error': '❌ Shift Error',
-                'message': 'An error occurred while accessing your shift information.',
-                'details': 'Please contact your administrator if this problem persists.',
-                'action_required': 'Contact administrator'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        # Check for held orders before allowing shift end
-        from sales.models import Cart
-        held_orders_count = Cart.objects.filter(cashier=cashier, status='held').count()
-        if held_orders_count > 0:
-            return Response({
-                'error': f'⚠️ Cannot End Shift',
-                'message': f'You have {held_orders_count} unfinished held order(s) that need to be completed or cancelled before ending your shift.',
-                'details': 'Please review your held orders and either complete the payments or cancel them before closing the shift.',
-                'action_required': 'Complete or cancel all held orders first'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        # Perform cash register reconciliation
-        from decimal import Decimal
-
-        # Calculate expected closing balance
-        # Expected = Opening Balance + Cash Sales (only cash payments count towards physical cash)
-        expected_balance = Decimal(str(shift.opening_balance)) + Decimal(str(shift.cash_sales))
-
-        # Convert closing balance to Decimal for consistency
-        actual_closing_balance = Decimal(str(closing_balance))
-
-        # Calculate discrepancy (Actual - Expected)
-        # Positive discrepancy = Overage (cashier has more than expected)
-        # Negative discrepancy = Shortage (cashier has less than expected)
-        discrepancy = actual_closing_balance - expected_balance
-
-        # Update shift with closing information
-        shift.end_time = timezone.now()
-        shift.closing_balance = actual_closing_balance
-        shift.discrepancy = discrepancy
-        shift.status = 'closed'
-
-        # Final totals are already calculated during sales
-        shift.save()
-        print(f"EndShiftView: Shift {shift.id} closed successfully for user {cashier.user.username}")
-        print(f"EndShiftView: Expected: {expected_balance}, Actual: {actual_closing_balance}, Discrepancy: {discrepancy}")
-
-        serializer = self.get_serializer(shift)
-
-        # Return comprehensive shift data with detailed reconciliation
-        response_data = serializer.data
-        response_data.update({
-            'reconciliation': {
-                'opening_balance': float(shift.opening_balance),
-                'cash_sales': float(shift.cash_sales),
-                'card_sales': float(shift.card_sales),
-                'mobile_sales': float(shift.mobile_sales),
-                'total_sales': float(shift.total_sales),
-                'expected_closing_balance': float(expected_balance),
-                'actual_closing_balance': float(actual_closing_balance),
-                'discrepancy': float(discrepancy),
-                'discrepancy_type': 'overage' if discrepancy > 0 else 'shortage' if discrepancy < 0 else 'balanced',
-                'discrepancy_description': (
-                    f"{'Overage' if discrepancy > 0 else 'Shortage' if discrepancy < 0 else 'Balanced'}: "
-                    f"Ksh {abs(float(discrepancy)):.2f}"
-                )
-            },
-            'status_message': (
-                f"Shift closed successfully!\n"
-                f"Expected Cash: Ksh {float(expected_balance):.2f}\n"
-                f"Actual Cash: Ksh {float(actual_closing_balance):.2f}\n"
-                f"{'Overage' if discrepancy > 0 else 'Shortage' if discrepancy < 0 else 'Balanced'}: "
-                f"Ksh {abs(float(discrepancy)):.2f}"
-            )
-        })
-
-        return Response(response_data, status=status.HTTP_200_OK)
-
-class CurrentShiftView(generics.GenericAPIView):
-    serializer_class = ShiftSerializer
-
-    def get(self, request, *args, **kwargs):
-        from users.models import UserProfile
-        # Get or create user profile for authenticated user
-        user_profile, created = UserProfile.objects.get_or_create(
-            user=request.user,
-            defaults={'role': 'cashier'}
-        )
-        if created:
-            print(f"CurrentShiftView: Created UserProfile for user {request.user}")
-
-        try:
-            shift = Shift.objects.get(cashier=user_profile, status='open')
-            print(f"CurrentShiftView: Found open shift {shift.id} for user {user_profile.user.username}")
-            print(f"CurrentShiftView: Shift data - status: {shift.status}, start_time: {shift.start_time}")
-            serializer = self.get_serializer(shift)
-            data = serializer.data
-            print(f"CurrentShiftView: Serialized data: {data}")
-            return Response(data, status=status.HTTP_200_OK)
-        except Shift.DoesNotExist:
-            print(f"CurrentShiftView: No open shift found for user {user_profile.user.username}")
-            return Response({'detail': 'No active shift found'}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            print(f"CurrentShiftView: Error serializing shift: {e}")
-            import traceback
-            traceback.print_exc()
-            return Response({'error': f'Error retrieving shift data: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class AllShiftsView(generics.ListAPIView):
-    serializer_class = ShiftSerializer
-    pagination_class = PageNumberPagination
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['cashier', 'status', 'start_time', 'end_time']
-    search_fields = ['cashier__user__username', 'cashier__user__first_name', 'cashier__user__last_name']
-    ordering_fields = ['start_time', 'end_time', 'total_sales', 'transaction_count']
-    ordering = ['-start_time']
-
+    
+    def list(self, request, *args, **kwargs):
+        # Check if limit is provided and bypass pagination
+        limit = request.query_params.get('limit')
+        if limit:
+            try:
+                queryset = self.filter_queryset(self.get_queryset())
+                # Apply limit directly
+                page = queryset[:int(limit)]
+                serializer = self.get_serializer(page, many=True)
+                return Response(serializer.data)
+            except ValueError:
+                pass
+        # Default behavior
+        return super().list(request, *args, **kwargs)
+    
     def get_queryset(self):
-        queryset = Shift.objects.all()
-
+        queryset = super().get_queryset()
+        
+        # Filter by user_id if provided - ensure data isolation between users
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(cashier__user_id=user_id)
+        
         # Filter by date range if provided
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
-
+        
         if start_date:
             queryset = queryset.filter(start_time__date__gte=start_date)
         if end_date:
             queryset = queryset.filter(start_time__date__lte=end_date)
-
+            
         return queryset
+
+
+class CurrentShiftView(generics.RetrieveAPIView):
+    """Get the current active shift for the authenticated cashier"""
+    serializer_class = ShiftSerializer
+    permission_classes = []
+    
+    def get_object(self):
+        # Get the user ID from request - user_id is REQUIRED
+        user_id = self.request.query_params.get('user_id') or \
+                  self.request.data.get('user_id')
+        
+        if not user_id:
+            # Return no shift if user_id is not provided
+            return None
+        
+        # Look for active shift for this specific user
+        from users.models import UserProfile
+        from django.contrib.auth.models import User
+        
+        profile = None
+        try:
+            # First try to get UserProfile by ID (userprofile.id)
+            profile = UserProfile.objects.get(id=user_id)
+        except (UserProfile.DoesNotExist, ValueError):
+            try:
+                # Fallback: try to get UserProfile by user_id (Django User ID)
+                user = User.objects.get(id=user_id)
+                profile = user.userprofile
+            except (User.DoesNotExist, UserProfile.DoesNotExist, AttributeError):
+                pass
+        
+        if not profile:
+            return None
+        
+        shift = Shift.objects.filter(
+            cashier=profile,
+            status='open'
+        ).first()
+        
+        if shift:
+            return shift
+        
+        # No active shift for this user - return None (don't return last closed shift)
+        logger.info(f"No active shift for user_id: {user_id}")
+        return None
+    
+    def retrieve(self, request, *args, **kwargs):
+        """Override retrieve to handle None case properly"""
+        instance = self.get_object()
+        
+        if instance is None:
+            # No active shift - check for last closed shift
+            user_id = request.query_params.get('user_id')
+            last_shift_info = None
+            
+            if user_id:
+                from users.models import UserProfile
+                from django.contrib.auth.models import User
+                
+                profile = None
+                try:
+                    profile = UserProfile.objects.get(id=user_id)
+                except (UserProfile.DoesNotExist, ValueError):
+                    try:
+                        user = User.objects.get(id=user_id)
+                        profile = user.userprofile
+                    except (User.DoesNotExist, UserProfile.DoesNotExist, AttributeError):
+                        pass
+                
+                if profile:
+                    last_shift = Shift.objects.filter(
+                        cashier=profile,
+                        status='closed'
+                    ).order_by('-end_time').first()
+                    
+                    if last_shift:
+                        last_shift_info = {
+                            'id': last_shift.id,
+                            'end_time': last_shift.end_time,
+                            'closing_balance': float(last_shift.closing_balance or 0),
+                            'total_sales': float(last_shift.total_sales or 0),
+                            'discrepancy': float(last_shift.discrepancy or 0),
+                            'status': last_shift.status
+                        }
+            
+            return Response({
+                'has_active_shift': False,
+                'status': 'closed',
+                'last_shift_info': last_shift_info
+            })
+        
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+
+class StartShiftView(generics.CreateAPIView):
+    """Start a new shift"""
+    serializer_class = ShiftSerializer
+    from rest_framework.permissions import IsAuthenticated
+    permission_classes = [IsAuthenticated]
+    
+    def create(self, request, *args, **kwargs):
+        logger.info(f"[StartShift] Request user: {request.user}")
+        logger.info(f"[StartShift] Request data: {request.data}")
+        logger.info(f"[StartShift] Is authenticated: {request.user.is_authenticated}")
+        
+        # Accept both 'opening_balance' and 'starting_cash' for flexibility
+        opening_balance = request.data.get('opening_balance') or request.data.get('starting_cash', 0)
+        
+        # Get user from authenticated request - create profile if missing
+        try:
+            profile = request.user.userprofile
+            logger.info(f"[StartShift] Found profile: {profile.id}")
+        except Exception as e:
+            logger.warning(f"[StartShift] Profile not found, creating one: {e}")
+            # Create missing UserProfile
+            from users.models import UserProfile
+            profile = UserProfile.objects.create(
+                user=request.user,
+                role='cashier',
+                is_active=True
+            )
+            logger.info(f"[StartShift] Created profile: {profile.id}")
+        
+        # Check for existing active shift
+        existing_shift = Shift.objects.filter(
+            cashier=profile,
+            status='open'
+        ).first()
+        
+        if existing_shift:
+            return Response(
+                {'error': 'You already have an active shift', 'shift_id': existing_shift.id},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create new shift
+        shift = Shift.objects.create(
+            cashier=profile,
+            opening_balance=opening_balance,
+            start_time=timezone.now(),
+            status='open'
+        )
+        
+        logger.info(f"[StartShift] Created shift: {shift.id}")
+        return Response(
+            ShiftSerializer(shift).data,
+            status=status.HTTP_201_CREATED
+        )
+
+
+class EndShiftView(generics.GenericAPIView):
+    """End the current shift"""
+    serializer_class = ShiftSerializer
+    permission_classes = []
+    
+    def get_queryset(self):
+        return Shift.objects.filter(status='open').exclude(status__isnull=True)
+    
+    def get_object(self):
+        """Get the active shift - either from shift_id param or find the active one"""
+        shift_id = self.request.data.get('shift_id') or self.request.query_params.get('shift_id')
+        
+        if shift_id:
+            try:
+                shift = Shift.objects.get(id=shift_id, status='open')
+                logger.error(f"Active shift found by shift_id: {shift.id}")
+                return shift
+            except Shift.DoesNotExist:
+                # Check if shift exists but is closed
+                try:
+                    closed_shift = Shift.objects.get(id=shift_id, status='closed')
+                    logger.error(f"Shift exists but is closed: {shift_id}")
+                    return closed_shift
+                except Shift.DoesNotExist:
+                    logger.error(f"No shift found with shift_id: {shift_id}")
+        
+        # Fallback: get the first active shift for the user
+        user_id = self.request.data.get('user_id') or self.request.query_params.get('user_id')
+        if user_id:
+            from users.models import UserProfile
+            try:
+                profile = UserProfile.objects.get(id=user_id)
+                # First check for open shift
+                shift = Shift.objects.get(cashier=profile, status='open')
+                logger.error(f"Active shift found by user_id: {user_id}, shift_id: {shift.id}")
+                return shift
+            except Shift.DoesNotExist:
+                # Check if user has any closed shifts
+                from users.models import UserProfile
+                try:
+                    profile = UserProfile.objects.get(id=user_id)
+                    closed_shift = Shift.objects.filter(cashier=profile, status='closed').order_by('-end_time').first()
+                    if closed_shift:
+                        logger.error(f"User has closed shifts, latest: {closed_shift.id}")
+                        return closed_shift
+                except (UserProfile.DoesNotExist, ValueError):
+                    pass
+                logger.error(f"No active shift found for user_id: {user_id}")
+        
+        # Final fallback: require user_id - do NOT return any shift
+        logger.error(f"No active shift found - user_id required")
+        return None
+    
+    def post(self, request, *args, **kwargs):
+        """End a shift using POST"""
+        logger.error(f"Shift data: {request.data}")
+        
+        instance = self.get_object()
+        
+        if not instance:
+            logger.error("No active shift found")
+            # Try to find any closed shift to return its status
+            user_id = request.data.get('user_id') or request.query_params.get('user_id')
+            if user_id:
+                from users.models import UserProfile
+                try:
+                    profile = UserProfile.objects.get(id=user_id)
+                    closed_shift = Shift.objects.filter(cashier=profile, status='closed').order_by('-end_time').first()
+                    if closed_shift:
+                        return Response(
+                            {
+                                'message': 'Shift is already closed',
+                                'shift': ShiftSerializer(closed_shift).data,
+                                'shift_status': 'closed'
+                            },
+                            status=status.HTTP_200_OK
+                        )
+                except (UserProfile.DoesNotExist, ValueError):
+                    pass
+            
+            # Return proper error - require user_id to check for shifts
+            return Response(
+                {'error': 'No active shift found. Please start a shift first.', 'no_active_shift': True},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check if shift is already closed
+        if instance.status == 'closed':
+            logger.error(f"Shift {instance.id} is already closed")
+            return Response(
+                {
+                    'message': 'Shift is already closed',
+                    'shift': ShiftSerializer(instance).data,
+                    'shift_status': 'closed'
+                },
+                status=status.HTTP_200_OK
+            )
+        
+        # Get cash count from request - accept both 'ending_cash' and 'actual_cash'
+        # Note: we must check for None explicitly since 0 is a valid cash amount
+        actual_cash = request.data.get('ending_cash')
+        if actual_cash is None:
+            actual_cash = request.data.get('actual_cash')
+        
+        # Calculate expected cash considering returns (cash refunds reduce expected cash)
+        # Formula: expected = opening_balance + cash_sales - cash_returns
+        total_returns = float(instance.total_returns) if instance.total_returns else 0
+        expected_cash = float(instance.opening_balance) + float(instance.cash_sales) - total_returns
+        
+        # Calculate discrepancy: actual - expected
+        # Positive = overage (more cash than expected)
+        # Negative = shortage (less cash than expected)
+        discrepancy = float(actual_cash) - expected_cash if actual_cash is not None else 0
+        
+        # Determine discrepancy type
+        if discrepancy < 0:
+            discrepancy_type = 'shortage'
+            discrepancy_description = f'Shortage: KSh {abs(discrepancy):.2f}'
+        elif discrepancy > 0:
+            discrepancy_type = 'overage'
+            discrepancy_description = f'Overage: KSh {abs(discrepancy):.2f}'
+        else:
+            discrepancy_type = 'balanced'
+            discrepancy_description = 'Perfect balance'
+        
+        # Update shift
+        instance.end_time = timezone.now()
+        instance.closing_balance = actual_cash
+        instance.discrepancy = discrepancy
+        instance.status = 'closed'
+        instance.save()
+        
+        # Build reconciliation response
+        reconciliation = {
+            'shift_id': instance.id,
+            'shift_status': instance.status,
+            'opening_balance': float(instance.opening_balance),
+            'cash_sales': float(instance.cash_sales),
+            'card_sales': float(instance.card_sales),
+            'mobile_sales': float(instance.mobile_sales),
+            'total_sales': float(instance.total_sales),
+            'total_returns': float(total_returns),
+            'expected_closing_balance': expected_cash,
+            'actual_closing_balance': float(actual_cash) if actual_cash is not None else 0,
+            'discrepancy': discrepancy,
+            'discrepancy_type': discrepancy_type,
+            'discrepancy_description': discrepancy_description,
+            'end_time': instance.end_time.isoformat() if instance.end_time else None,
+        }
+        
+        return Response(
+            {
+                'message': 'Shift ended successfully',
+                'shift': ShiftSerializer(instance).data,
+                'reconciliation': reconciliation,
+                'shift_status': 'closed'
+            },
+            status=status.HTTP_200_OK
+        )
+    
+    def put(self, request, *args, **kwargs):
+        """End a shift using PUT (alias for POST)"""
+        return self.post(request, *args, **kwargs)
+    
+    def patch(self, request, *args, **kwargs):
+        """End a shift using PATCH (alias for POST)"""
+        return self.post(request, *args, **kwargs)
+
+
+class EndShiftTestView(generics.GenericAPIView):
+    """Test endpoint to verify POST works"""
+    serializer_class = ShiftSerializer
+    permission_classes = []
+    
+    def post(self, request, *args, **kwargs):
+        return Response({'message': 'POST to end-test works!', 'data': request.data})
+    
+    def get(self, request, *args, **kwargs):
+        return Response({'message': 'GET to end-test works!'})
+
+
+class AllShiftsView(generics.ListAPIView):
+    """Get all shifts with optional filtering"""
+    serializer_class = ShiftSerializer
+    permission_classes = []
+    pagination_class = PageNumberPagination
+    
+    def get_queryset(self):
+        queryset = Shift.objects.prefetch_related(
+            'sale_set__customer',
+            'cashier__user'
+        ).select_related(
+            'cashier__user',
+            'approved_by'
+        ).order_by('-start_time')
+        
+        # Filter by user_id - ensure data isolation
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            queryset = queryset.filter(cashier__user_id=user_id)
+        
+        # Filter by cashier (UserProfile ID)
+        cashier_id = self.request.query_params.get('cashier_id')
+        if cashier_id:
+            queryset = queryset.filter(cashier_id=cashier_id)
+        
+        # Filter by status
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        
+        # Filter by date range
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        
+        if start_date:
+            queryset = queryset.filter(start_time__date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(start_time__date__lte=end_date)
+        
+        return queryset
+
+
+class AdminShiftManagementView(generics.UpdateAPIView):
+    """Admin endpoint to manage shifts"""
+    serializer_class = ShiftSerializer
+    permission_classes = []
+    lookup_field = 'id'
+    lookup_url_kwarg = 'shift_id'
+    
+    def get_queryset(self):
+        return Shift.objects.all()
+    
+    def update(self, request, *args, **kwargs):
+        action = kwargs.pop('action', None)
+        instance = self.get_object()
+        
+        if action == 'reopen':
+            # Reopen a closed shift
+            instance.end_time = None
+            instance.status = 'open'
+            instance.save()
+            return Response(ShiftSerializer(instance).data)
+        
+        elif action == 'force_close':
+            # Force close an active shift
+            instance.end_time = timezone.now()
+            instance.status = 'closed'
+            instance.save()
+            return Response(ShiftSerializer(instance).data)
+        
+        return super().update(request, *args, **kwargs)

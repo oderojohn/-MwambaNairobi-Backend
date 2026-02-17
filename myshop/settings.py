@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'django_redis',
+    'django_filters',
 
     # Local apps
     'users',
@@ -48,6 +49,8 @@ INSTALLED_APPS = [
     'shifts',
     'reports',
     'branches',
+    'etims',
+    'accounting',
 ]
 
 # Middleware
@@ -151,11 +154,11 @@ SESSION_CACHE_ALIAS = "default"
 
 # ✅ CORS settings
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3004",
+    "http://localhost:3000",
     "http://localhost:5173",
-    "http://127.0.0.1:3007",
+    "http://127.0.0.1:3001",
     "http://127.0.0.1:5173",
-    "http://localhost:3007",        # added
+    "http://localhost:3001",        # added
     "http://192.168.10.219:3001",   # added
     "https://mwambaliquor.netlify.app",  # added
 ]
@@ -168,6 +171,7 @@ CSRF_TRUSTED_ORIGINS = [
     "https://*.trycloudflare.com",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
+    "http://localhost:3001",
     "https://mwambaliquor.netlify.app",  # added
 ]
 

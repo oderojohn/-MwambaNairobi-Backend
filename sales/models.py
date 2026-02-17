@@ -1,6 +1,22 @@
 from django.db import models
+from django.utils import timezone
 
-# Create your models here.
+
+class ReceiptCounter(models.Model):
+    """
+    Tracks sequential receipt numbers
+    """
+    receipt_type = models.CharField(max_length=10, unique=True)
+    last_number = models.IntegerField(default=0)
+    date = models.DateField(default=timezone.now)
+
+    class Meta:
+        verbose_name = 'Receipt Counter'
+        verbose_name_plural = 'Receipt Counters'
+
+    def __str__(self):
+        return f"{self.receipt_type}: {self.last_number} ({self.date})"
+
 
 class Cart(models.Model):
     STATUS_CHOICES = [
@@ -46,6 +62,10 @@ class Sale(models.Model):
     final_amount = models.DecimalField(max_digits=10, decimal_places=2)
     sale_date = models.DateTimeField(auto_now_add=True)
     receipt_number = models.CharField(max_length=50, unique=True)
+    
+    # Return code functionality
+    return_code_used = models.CharField(max_length=20, null=True, blank=True)
+    return_code_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     # Void functionality
     voided = models.BooleanField(default=False)
@@ -67,19 +87,103 @@ class SaleItem(models.Model):
     quantity = models.PositiveIntegerField()
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     discount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    returned_quantity = models.PositiveIntegerField(default=0)  # Track how many items have been returned
 
     def __str__(self):
         return f"{self.product.name} - {self.quantity}"
+    
+    @property
+    def remaining_quantity(self):
+        """Returns the quantity that can still be returned"""
+        return self.quantity - self.returned_quantity
+    
+    @property
+    def is_fully_returned(self):
+        """Returns True if all items have been returned"""
+        return self.returned_quantity >= self.quantity
 
 class Return(models.Model):
+    RETURN_TYPES = [
+        ('full_return', 'Full Return'),
+        ('partial_return', 'Partial Return'),
+        ('exchange', 'Exchange'),
+    ]
+    
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE)
+    shift = models.ForeignKey('shifts.Shift', on_delete=models.SET_NULL, null=True, blank=True, related_name='returns')
     return_date = models.DateTimeField(auto_now_add=True)
+    return_type = models.CharField(max_length=20, choices=RETURN_TYPES, default='partial_return')
     reason = models.TextField()
     total_refund_amount = models.DecimalField(max_digits=10, decimal_places=2)
     processed_by = models.ForeignKey('users.UserProfile', on_delete=models.SET_NULL, null=True)
+    receipt_number = models.CharField(max_length=50, unique=True, blank=True, null=True)
 
     def __str__(self):
         return f"Return for Sale {self.sale.receipt_number}"
+
+    def save(self, *args, **kwargs):
+        """Auto-set shift from sale if not provided"""
+        if not self.shift and hasattr(self, 'sale') and self.sale:
+            self.shift = self.sale.shift
+        super().save(*args, **kwargs)
+
+class ReturnItem(models.Model):
+    """Individual items in a return"""
+    return_record = models.ForeignKey(Return, on_delete=models.CASCADE, related_name='items')
+    sale_item = models.ForeignKey(SaleItem, on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField()
+    reason = models.TextField()
+    refund_amount = models.DecimalField(max_digits=10, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.quantity}x from Return {self.return_record.id}"
+
+class ReturnCode(models.Model):
+    """Return codes for tracking refunds"""
+    STATUS_CHOICES = [
+        ('active', 'Active'),
+        ('used', 'Used'),
+        ('cancelled', 'Cancelled'),
+        ('expired', 'Expired'),
+    ]
+    
+    code = models.CharField(max_length=12, unique=True)
+    return_record = models.ForeignKey(Return, on_delete=models.CASCADE, related_name='return_codes', null=True, blank=True)
+    refund_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    original_receipt_number = models.CharField(max_length=50)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    created_at = models.DateTimeField(auto_now_add=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    used_in_sale = models.ForeignKey('Sale', on_delete=models.SET_NULL, null=True, blank=True, related_name='applied_return_codes')
+    
+    def __str__(self):
+        return f"ReturnCode {self.code}"
+    
+    @staticmethod
+    def generate_code(refund_amount, receipt_number):
+        """Generate a unique return code"""
+        import random
+        import string
+        
+        # Generate code: 4 letters + 4 numbers
+        while True:
+            letters = ''.join(random.choices(string.ascii_uppercase, k=4))
+            numbers = ''.join(random.choices(string.digits, k=4))
+            code = f"{letters}{numbers}"
+            
+            # Check if code already exists
+            if not ReturnCode.objects.filter(code=code).exists():
+                return code
+
+class ExchangeItem(models.Model):
+    """Items exchanged for other products in a return"""
+    return_record = models.ForeignKey(Return, on_delete=models.CASCADE, related_name='exchange_items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.CASCADE)
+    quantity = models.PositiveIntegerField()
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.quantity}x {self.product.name} for Return {self.return_record.id}"
 
 class Invoice(models.Model):
     INVOICE_STATUS = [

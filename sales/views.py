@@ -8,12 +8,14 @@ from django.utils import timezone
 from django.db import transaction
 from django.conf import settings
 from django.db.models import Q
-from .models import Cart, CartItem, Sale, SaleItem, Return, Invoice, InvoiceItem, AuditLog
+from .models import Cart, CartItem, Sale, SaleItem, Return, ReturnItem, Invoice, InvoiceItem, AuditLog
+from chits.models import Chit
 from .serializers import CartSerializer, CartItemSerializer, SaleSerializer, SaleItemSerializer, ReturnSerializer, InvoiceSerializer, InvoiceItemSerializer, AuditLogSerializer
 from inventory.models import Product, StockMovement, SalesHistory
 from shifts.models import Shift
 from payments.models import Payment
 from .services import sales_service, stock_service, payment_service, audit_service
+from .services.receipt_number_service import get_next_receipt_number, get_next_return_receipt_number
 
 class CartViewSet(viewsets.ModelViewSet):
     queryset = Cart.objects.all()
@@ -24,9 +26,55 @@ class CartItemViewSet(viewsets.ModelViewSet):
     serializer_class = CartItemSerializer
 
 class SaleViewSet(viewsets.ModelViewSet):
-    queryset = Sale.objects.all()
+    queryset = Sale.objects.prefetch_related('saleitem_set').all()
     serializer_class = SaleSerializer
     pagination_class = PageNumberPagination
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['receipt_number', 'sale_type', 'voided', 'customer', 'shift']
+    search_fields = ['receipt_number', 'customer__name', 'customer__phone']
+    ordering_fields = ['-sale_date', 'sale_date', 'total_amount']
+    ordering = ['-sale_date']
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        
+        # Handle shift_id filter explicitly - also validate user if provided
+        shift_id = self.request.query_params.get('shift_id')
+        user_id = self.request.query_params.get('user_id')
+        
+        if shift_id:
+            # If user_id is provided, verify the shift belongs to this user
+            if user_id:
+                queryset = queryset.filter(shift_id=shift_id, shift__cashier__user_id=user_id)
+            else:
+                queryset = queryset.filter(shift_id=shift_id)
+        elif user_id:
+            # If only user_id is provided, filter by user
+            queryset = queryset.filter(shift__cashier__user_id=user_id)
+        
+        return queryset
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        print(f"[DEBUG] Sale retrieve - ID: {instance.id}, Receipt: {instance.receipt_number}")
+        
+        # Debug: Check items using different approaches
+        print(f"[DEBUG] Using prefetch: {list(instance.saleitem_set.all())}")
+        print(f"[DEBUG] Items count via prefetch: {instance.saleitem_set.count()}")
+        
+        # Try direct query
+        direct_items = SaleItem.objects.filter(sale=instance)
+        print(f"[DEBUG] Direct query items: {list(direct_items)}")
+        print(f"[DEBUG] Direct query count: {direct_items.count()}")
+        
+        for item in instance.saleitem_set.all():
+            print(f"[DEBUG]   Item: {item.id} - {item.product.name if item.product else 'No product'} - Qty: {item.quantity} - Price: {item.unit_price}")
+        
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+        print(f"[DEBUG] Serialized data keys: {data.keys()}")
+        print(f"[DEBUG] Serialized items: {data.get('items', 'NO ITEMS FIELD')}")
+        return Response(data)
 
     @action(detail=False, methods=['get'])
     def held_orders(self, request):
@@ -35,14 +83,28 @@ class SaleViewSet(viewsets.ModelViewSet):
         if hasattr(request.user, 'userprofile'):
             cashier = request.user.userprofile
 
+        # If no cashier/user, return empty list instead of error
         if not cashier:
-            return Response(
-                {'error': 'User profile not found'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response([])
 
         try:
-            held_carts = sales_service.get_held_orders(cashier)
+            # Check if shift_id is provided
+            shift_id = request.query_params.get('shift_id')
+            if shift_id:
+                # Filter by specific shift ID using the Shift model
+                from shifts.models import Shift
+                try:
+                    shift = Shift.objects.get(id=shift_id, cashier=cashier)
+                    # Cart doesn't have shift field, filter by cashier only for this shift
+                    held_carts = Cart.objects.filter(
+                        cashier=cashier,
+                        status='held'
+                    ).prefetch_related('cartitem_set__product').order_by('-created_at')
+                except Shift.DoesNotExist:
+                    held_carts = Cart.objects.none()
+            else:
+                # Default behavior - get held orders for current shift
+                held_carts = sales_service.get_held_orders(cashier)
         except ValueError as e:
             return Response(
                 {'error': str(e)},
@@ -50,6 +112,32 @@ class SaleViewSet(viewsets.ModelViewSet):
             )
 
         serializer = CartSerializer(held_carts, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def by_receipt(self, request):
+        """Search sales by receipt number (case-insensitive, exact or partial match)"""
+        receipt_number = request.query_params.get('receipt_number', '').strip()
+        
+        if not receipt_number:
+            return Response(
+                {'error': 'Receipt number is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Try exact match first, then case-insensitive partial match
+        sale = Sale.objects.filter(
+            Q(receipt_number__iexact=receipt_number) | 
+            Q(receipt_number__icontains=receipt_number)
+        ).first()
+        
+        if not sale:
+            return Response(
+                {'error': 'Transaction not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        serializer = SaleSerializer(sale)
         return Response(serializer.data)
 
     @action(detail=True, methods=['post'])
@@ -351,6 +439,173 @@ class SaleViewSet(viewsets.ModelViewSet):
             traceback.print_exc()
             return Response({
                 'error': 'Failed to void sale',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], permission_classes=[])
+    def void_items(self, request, pk=None):
+        """
+        Void specific items from a sale (partial void).
+        Restocks the voided items and updates sale/shift totals.
+        """
+        # Check admin/manager permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+            return Response(
+                {'error': 'Admin or Manager role required for this action'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            sale = Sale.objects.get(id=pk)
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if sale is already voided
+        if sale.voided:
+            return Response(
+                {'error': 'Cannot void items from an already voided sale'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get items to void
+        items_to_void = request.data.get('items', [])
+        if not items_to_void:
+            return Response(
+                {'error': 'No items specified for voiding'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        void_reason = request.data.get('reason', '').strip()
+        if not void_reason:
+            return Response(
+                {'error': 'Void reason is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            with transaction.atomic():
+                from .models import SaleItem, VoidItem
+                from inventory.models import Product
+                
+                voided_items = []
+                total_void_amount = 0
+                
+                for item_data in items_to_void:
+                    sale_item_id = item_data.get('sale_item_id')
+                    quantity = item_data.get('quantity', 1)
+                    
+                    try:
+                        sale_item = SaleItem.objects.get(id=sale_item_id, sale=sale)
+                    except SaleItem.DoesNotExist:
+                        return Response(
+                            {'error': f'Sale item {sale_item_id} not found'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
+                    
+                    # Check if item was already voided
+                    if hasattr(sale_item, '_voided') and sale_item._voided:
+                        continue
+                    
+                    # Calculate void amount
+                    void_qty = min(quantity, sale_item.quantity)
+                    void_amount = float(sale_item.unit_price) * void_qty
+                    
+                    # Create void item record
+                    void_item = VoidItem.objects.create(
+                        sale=sale,
+                        sale_item=sale_item,
+                        product=sale_item.product,
+                        quantity=void_qty,
+                        unit_price=sale_item.unit_price,
+                        total_amount=void_amount,
+                        reason=void_reason,
+                        voided_by=request.user.userprofile
+                    )
+                    
+                    # Update sale item to mark as voided
+                    sale_item._voided = True
+                    sale_item.quantity -= void_qty
+                    if sale_item.quantity == 0:
+                        sale_item.delete()
+                    else:
+                        sale_item.save()
+                    
+                    # Restore stock
+                    product = sale_item.product
+                    stock_service.adjust_stock(
+                        product_id=product.id,
+                        quantity=void_qty,
+                        movement_type='void',
+                        reference=f"Partial void: Sale {sale.receipt_number}",
+                        cashier=request.user.userprofile
+                    )
+                    
+                    # Update product history
+                    stock_service.log_stock_movement(
+                        product_id=product.id,
+                        movement_type='void',
+                        quantity=void_qty,
+                        reference=f"Partial void: Sale {sale.receipt_number}",
+                        notes=void_reason,
+                        cashier=request.user.userprofile
+                    )
+                    
+                    voided_items.append({
+                        'id': void_item.id,
+                        'product_name': product.name,
+                        'quantity': void_qty,
+                        'amount': void_amount
+                    })
+                    total_void_amount += void_amount
+                
+                # Update sale totals
+                if sale.saleitem_set.exists():
+                    # Recalculate sale totals
+                    items = sale.saleitem_set.all()
+                    sale.total_amount = sum(float(item.unit_price) * item.quantity for item in items)
+                    sale.tax_amount = sale.total_amount * 0.16  # 16% tax
+                    sale.discount_amount = 0
+                    sale.final_amount = sale.total_amount + sale.tax_amount - sale.discount_amount
+                    sale.save()
+                else:
+                    # No items left, mark sale as fully voided
+                    sale.voided = True
+                    sale.void_reason = f"Partial void resulted in empty sale: {void_reason}"
+                    sale.voided_at = timezone.now()
+                    sale.voided_by = request.user.userprofile
+                    sale.save()
+                
+                # Update shift totals
+                if sale.shift:
+                    payment_service.update_shift_totals_on_partial_void(sale.shift, total_void_amount)
+                
+                # Log the operation
+                audit_service.log_sale_operation(
+                    user=request.user.userprofile,
+                    operation='sale_edit',
+                    sale=sale,
+                    description=f'Partial void: {len(voided_items)} items voided from {sale.receipt_number}: {void_reason}',
+                    request=request
+                )
+                
+                return Response({
+                    'message': f'Successfully voided {len(voided_items)} item(s)',
+                    'voided_items': voided_items,
+                    'total_void_amount': total_void_amount,
+                    'sale_id': sale.id,
+                    'sale_final_amount': float(sale.final_amount),
+                    'voided_by': request.user.username
+                }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f'Error voiding items: {str(e)}')
+            import traceback
+            traceback.print_exc()
+            return Response({
+                'error': 'Failed to void items',
                 'details': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -1231,7 +1486,6 @@ class SaleViewSet(viewsets.ModelViewSet):
                 discount_amount = float(request.data.get('discount_amount', 0))
                 total_amount = float(request.data.get('total_amount', subtotal + tax_amount - discount_amount))
                 print(f"Calculated amounts - subtotal: {subtotal}, total: {total_amount}")
-                receipt_number = request.data.get('receipt_number', f'POS-{timezone.now().strftime("%Y%m%d%H%M%S")}')
 
                 # Get customer if provided
                 customer = None
@@ -1255,6 +1509,29 @@ class SaleViewSet(viewsets.ModelViewSet):
 
                 # Create sale
                 sale = sales_service.create_sale_from_cart(cart, request.data, cashier, current_shift)
+
+                # Handle return code if provided
+                return_code_data = request.data.get('return_code')
+                if return_code_data and isinstance(return_code_data, dict):
+                    return_code = return_code_data.get('code')
+                    return_code_amount = return_code_data.get('amount', 0)
+                    
+                    if return_code:
+                        # Update sale with return code info
+                        sale.return_code_used = return_code
+                        sale.return_code_amount = return_code_amount
+                        sale.save()
+                        
+                        # Mark the return code as used
+                        from .models import ReturnCode
+                        try:
+                            return_code_obj = ReturnCode.objects.get(code=return_code, status='active')
+                            return_code_obj.status = 'used'
+                            return_code_obj.used_at = timezone.now()
+                            return_code_obj.used_in_sale = sale
+                            return_code_obj.save()
+                        except ReturnCode.DoesNotExist:
+                            print(f"Return code {return_code} not found or already used")
 
                 # Update shift totals
                 payment_method = request.data.get('payment_method', 'cash').lower()
@@ -1328,6 +1605,273 @@ class SaleItemViewSet(viewsets.ModelViewSet):
 class ReturnViewSet(viewsets.ModelViewSet):
     queryset = Return.objects.all()
     serializer_class = ReturnSerializer
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['shift']
+    ordering_fields = ['-return_date', 'return_date', 'total_refund_amount']
+    ordering = ['-return_date']
+    pagination_class = PageNumberPagination
+    page_size = 100
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
+
+    def get_queryset(self):
+        """Prefetch related objects for better performance"""
+        from django.db.models import Prefetch
+        
+        queryset = Return.objects.prefetch_related(
+            Prefetch('items', queryset=ReturnItem.objects.select_related('sale_item__product')),
+            'sale',
+            'sale__cart',
+            'processed_by__user',
+            'shift'
+        ).select_related('sale__customer')
+        
+        # Handle shift_id filter explicitly
+        shift_id = self.request.query_params.get('shift_id')
+        user_id = self.request.query_params.get('user_id')
+        
+        # For admin users, show all returns; for regular users, filter by their returns
+        if not self.request.user.is_staff:
+            if shift_id:
+                queryset = queryset.filter(shift_id=shift_id)
+            elif user_id:
+                queryset = queryset.filter(shift__cashier__user_id=user_id)
+            # Otherwise, filter by current user's returns via their profile
+            elif hasattr(self.request.user, 'userprofile'):
+                try:
+                    from users.models import UserProfile
+                    user_profile = self.request.user.userprofile
+                    queryset = queryset.filter(processed_by=user_profile)
+                except:
+                    pass
+        # Admin users see all returns
+        
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """Create a return/exchange with stock adjustments"""
+        print(f"[DEBUG] Return create - request.data: {request.data}")
+        try:
+            with transaction.atomic():
+                # Get the original sale
+                sale_id = request.data.get('original_sale_id')
+                print(f"[DEBUG] Original sale ID: {sale_id}")
+                try:
+                    sale = Sale.objects.get(id=sale_id)
+                except Sale.DoesNotExist:
+                    return Response(
+                        {'error': 'Sale not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+                # Get the cashier - check if user is admin
+                is_admin = request.user.is_staff
+                cashier = None
+                current_shift = None
+                
+                if is_admin:
+                    # Admin users can process returns without needing a shift
+                    # Try to get userprofile if exists, otherwise allow admin to proceed
+                    if hasattr(request.user, 'userprofile'):
+                        cashier = request.user.userprofile
+                        # Try to get open shift, but don't require it for admin
+                        from shifts.models import Shift
+                        current_shift = Shift.objects.filter(
+                            cashier=cashier,
+                            status='open'
+                        ).first()
+                    # If admin has no userprofile, we can still proceed
+                else:
+                    # Regular users need a userprofile and open shift
+                    if hasattr(request.user, 'userprofile'):
+                        cashier = request.user.userprofile
+
+                    if not cashier:
+                        return Response(
+                            {'error': 'User profile not found'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                    # Get the current active shift for this cashier
+                    from shifts.models import Shift
+                    current_shift = Shift.objects.filter(
+                        cashier=cashier,
+                        status='open'
+                    ).first()
+
+                    if not current_shift:
+                        return Response(
+                            {'error': 'No active shift found. Please open a shift first.'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                return_type = request.data.get('return_type', 'partial_return')
+                items_data = request.data.get('items', [])
+
+                # Validate items before processing - check for duplicate returns
+                for item_data in items_data:
+                    sale_item_id = item_data.get('sale_item_id')
+                    if not sale_item_id:
+                        return Response(
+                            {'error': 'sale_item_id is required for each item'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    try:
+                        sale_item = SaleItem.objects.get(id=sale_item_id)
+                    except SaleItem.DoesNotExist:
+                        return Response(
+                            {'error': f'Sale item with id {sale_item_id} not found'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
+                    
+                    requested_qty = item_data.get('quantity', 0)
+                    if requested_qty <= 0:
+                        return Response(
+                            {'error': 'Quantity must be greater than 0'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    remaining_qty = sale_item.remaining_quantity
+                    
+                    if requested_qty > remaining_qty:
+                        return Response(
+                            {'error': f'Cannot return {requested_qty} items of "{sale_item.product.name}". Only {remaining_qty} available for return (already returned: {sale_item.returned_quantity}).'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                # Generate sequential receipt number
+                receipt_number = get_next_return_receipt_number()
+
+                # Calculate total refund amount
+                total_refund = 0
+                for item_data in items_data:
+                    sale_item = SaleItem.objects.get(id=item_data['sale_item_id'])
+                    total_refund += float(sale_item.unit_price) * item_data['quantity']
+
+                # Create the return record
+                return_record = Return.objects.create(
+                    sale=sale,
+                    shift=current_shift,  # Associate with current shift
+                    return_type=return_type,
+                    reason=', '.join([item['reason'] for item in items_data]),
+                    total_refund_amount=total_refund,
+                    receipt_number=receipt_number,
+                    processed_by=cashier
+                )
+
+                # Create return items and update returned_quantity
+                for item_data in items_data:
+                    sale_item = SaleItem.objects.get(id=item_data['sale_item_id'])
+                    refund_amount = float(sale_item.unit_price) * item_data['quantity']
+                    
+                    ReturnItem.objects.create(
+                        return_record=return_record,
+                        sale_item=sale_item,
+                        quantity=item_data['quantity'],
+                        reason=item_data['reason'],
+                        refund_amount=refund_amount
+                    )
+
+                    # Update the returned_quantity on the sale item
+                    sale_item.returned_quantity += item_data['quantity']
+                    sale_item.save()
+
+                    # Update stock: add back returned items
+                    # cashier can be None for admin users - StockMovement allows null
+                    product = sale_item.product
+                    stock_service.adjust_stock(
+                        product_id=product.id,
+                        quantity=item_data['quantity'],
+                        movement_type='return',
+                        reference=f"Return: {receipt_number}",
+                        cashier=cashier
+                    )
+
+                # Create return chit for customer record
+                chit_content = f"""RETURN RECEIPT
+================
+Return ID: {return_record.id}
+Original Receipt: {sale.receipt_number}
+Return Date: {return_record.return_date.strftime('%Y-%m-%d %H:%M')}
+
+Returned Items:
+"""
+                for item_data in items_data:
+                    sale_item = SaleItem.objects.get(id=item_data['sale_item_id'])
+                    chit_content += f"- {sale_item.product.name}: {item_data['quantity']} x {sale_item.unit_price}"
+                    if item_data.get('reason'):
+                        chit_content += f" ({item_data['reason']})"
+                    chit_content += "\n"
+                
+                chit_content += f"""
+Total Refund: {total_refund}
+"""
+                
+                # Generate return code for refund
+                from .models import ReturnCode
+                return_code = ReturnCode.generate_code(
+                    refund_amount=total_refund,
+                    receipt_number=sale.receipt_number
+                )
+                
+                # Create return code record
+                return_code_obj = ReturnCode.objects.create(
+                    code=return_code,
+                    return_record=return_record,
+                    refund_amount=total_refund,
+                    original_receipt_number=sale.receipt_number
+                )
+                
+                # Add return code to chit
+                chit_content += f"""
+====================
+RETURN CODE: {return_code}
+Use this code for future refunds
+"""
+                
+                # Get or create a simple return record in Chit format
+                customer = sale.customer
+                chit = Chit.objects.create(
+                    customer=customer,
+                    customer_name=customer.name if customer else 'Walk-in Customer',
+                    amount=total_refund,
+                    description=chit_content,
+                    status='closed'
+                )
+
+                # Create audit log
+                audit_service.log_action(
+                    user=request.user,
+                    action='return_created',
+                    details={
+                        'return_id': return_record.id,
+                        'receipt_number': receipt_number,
+                        'original_sale': sale.receipt_number,
+                        'return_type': return_type,
+                        'total_refund': total_refund
+                    },
+                    request=request
+                )
+
+                serializer = self.get_serializer(return_record)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except Sale.DoesNotExist:
+            return Response(
+                {'error': 'Sale not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Product.DoesNotExist:
+            return Response(
+                {'error': 'Product not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 class InvoiceViewSet(viewsets.ModelViewSet):
     queryset = Invoice.objects.all()

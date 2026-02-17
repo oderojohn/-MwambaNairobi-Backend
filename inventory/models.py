@@ -33,6 +33,30 @@ class Product(models.Model):
     def is_low_stock(self):
         return self.stock_quantity <= self.low_stock_threshold
 
+    def recalculate_stock_from_batches(self):
+        """Recalculate stock_quantity from actual batch quantities"""
+        from django.utils import timezone
+        from django.db.models import Sum
+        
+        # Get sum of all received batches (excluding damaged/expired)
+        total_from_batches = self.batch_set.filter(
+            status='received'
+        ).exclude(
+            status__in=['damaged', 'expired'],
+            expiry_date__lt=timezone.now().date()
+        ).aggregate(total=Sum('quantity'))['total'] or 0
+        
+        # Update stock_quantity
+        self.stock_quantity = total_from_batches
+        self.save(update_fields=['stock_quantity'])
+        
+        return total_from_batches
+
+    @property
+    def actual_stock(self):
+        """Get actual available stock from batches"""
+        return self.recalculate_stock_from_batches()
+
     def save(self, *args, **kwargs):
         # Track changes for history logging
         is_new = self.pk is None

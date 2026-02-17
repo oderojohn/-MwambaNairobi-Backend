@@ -136,3 +136,15 @@ def update_shift_totals_on_void(shift, sale):
     # Subtract from total sales
     shift.total_sales = F('total_sales') - void_amount
     shift.save(update_fields=['total_sales'])
+
+
+def update_shift_totals_on_partial_void(shift, void_amount):
+    """Update shift totals when voiding specific items from a sale (partial void)"""
+    if not shift:
+        return
+
+    void_amount = Decimal(str(void_amount))
+
+    # Subtract from total sales
+    shift.total_sales = F('total_sales') - void_amount
+    shift.save(update_fields=['total_sales'])

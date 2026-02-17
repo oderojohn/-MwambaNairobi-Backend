@@ -55,6 +55,43 @@ class ProductViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(products, many=True, context={'request': request})
         return Response(serializer.data)
 
+    @action(detail=False, methods=['post'])
+    def recalculate_stock(self, request):
+        """Recalculate stock_quantity for all products from batch quantities"""
+        products = Product.objects.all()
+        results = []
+        
+        for product in products:
+            old_stock = product.stock_quantity
+            new_stock = product.recalculate_stock_from_batches()
+            results.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'old_stock': old_stock,
+                'new_stock': new_stock,
+                'difference': new_stock - old_stock
+            })
+        
+        return Response({
+            'message': f'Stock recalculated for {len(results)} products',
+            'results': results
+        })
+
+    @action(detail=True, methods=['post'])
+    def sync_stock(self, request, pk=None):
+        """Recalculate stock for a single product"""
+        product = self.get_object()
+        old_stock = product.stock_quantity
+        new_stock = product.recalculate_stock_from_batches()
+        
+        return Response({
+            'product_id': product.id,
+            'product_name': product.name,
+            'old_stock': old_stock,
+            'new_stock': new_stock,
+            'difference': new_stock - old_stock
+        })
+
 class BatchViewSet(viewsets.ModelViewSet):
     queryset = Batch.objects.all()
     serializer_class = BatchSerializer
@@ -109,16 +146,6 @@ class BatchViewSet(viewsets.ModelViewSet):
 
         # Create stock movement with actual received quantity
         batch.receive_batch(actual_quantity)
-
-        # Create receiving log entry
-        from .models import StockMovement
-        StockMovement.objects.create(
-            product=batch.product,
-            movement_type='in',
-            quantity=actual_quantity,
-            reason=f'Batch {batch.batch_number} received - {condition} condition. Notes: {notes}',
-            user=request.user.userprofile if hasattr(request.user, 'userprofile') else None
-        )
 
         serializer = self.get_serializer(batch)
         return Response({

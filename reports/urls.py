@@ -2,7 +2,8 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     ReportViewSet, SalesSummaryView, InventorySummaryView,
-    CustomerSummaryView, ShiftSummaryView, ProductPriceListPDFView
+    CustomerSummaryView, ShiftSummaryView, ProductPriceListPDFView,
+    ReturnsSummaryView
 )
 
 router = DefaultRouter()
@@ -17,4 +18,5 @@ urlpatterns = [
     path('profitloss-summary/', SalesSummaryView.as_view(), name='profitloss-summary'),
     path('sales-chit/<int:sale_id>/', SalesSummaryView.as_view(), name='sales-chit'),
     path('product-price-list-pdf/', ProductPriceListPDFView.as_view(), name='product-price-list-pdf'),
+    path('returns-summary/', ReturnsSummaryView.as_view(), name='returns-summary'),
 ]

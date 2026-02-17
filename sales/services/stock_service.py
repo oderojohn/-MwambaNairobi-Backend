@@ -7,6 +7,9 @@ from .audit_service import log_stock_operation
 
 def validate_stock_availability(cart_items):
     """Validate that all items in cart have sufficient stock"""
+    from inventory.models import Batch
+    from django.utils import timezone
+    
     stock_deductions = []
     for cart_item in cart_items:
         product = cart_item.product
@@ -16,8 +19,22 @@ def validate_stock_availability(cart_items):
         if requested_quantity <= 0:
             raise ValueError(f'Invalid quantity for product "{product.name}". Quantity must be positive.')
 
-        if float(product.stock_quantity) < requested_quantity:
-            raise ValueError(f'Insufficient stock for product "{product.name}". Available: {product.stock_quantity}, Requested: {requested_quantity}')
+        # Calculate actual available stock from batches (more accurate than product.stock_quantity)
+        available_batches = Batch.objects.filter(
+            product=product,
+            quantity__gt=0
+        ).exclude(
+            status__in=['damaged', 'expired'],
+            expiry_date__lt=timezone.now().date()
+        )
+        
+        actual_available = sum(batch.quantity for batch in available_batches)
+        
+        # Use actual batch stock if available, otherwise fall back to product.stock_quantity
+        available_stock = max(actual_available, float(product.stock_quantity)) if actual_available > 0 else float(product.stock_quantity)
+        
+        if available_stock < requested_quantity:
+            raise ValueError(f'Insufficient stock for product "{product.name}". Available: {int(available_stock)}, Requested: {requested_quantity}')
 
         stock_deductions.append({
             'product': product,
@@ -230,4 +247,63 @@ def restore_stock_quantity(product, quantity, sale, user, request=None):
         old_values={'stock_quantity': old_quantity},
         new_values={'stock_quantity': float(product.stock_quantity)},
         request=request
+    )
+
+
+def adjust_stock(product_id, quantity, movement_type, reference, cashier):
+    """Adjust stock for returns and exchanges - add or remove stock"""
+    try:
+        product = Product.objects.get(id=product_id)
+    except Product.DoesNotExist:
+        raise ValueError(f'Product with ID {product_id} not found')
+
+    # Validate quantity
+    abs_quantity = abs(quantity)
+    if abs_quantity <= 0:
+        raise ValueError('Quantity must be positive or negative')
+
+    # Store old quantity for logging
+    old_quantity = float(product.stock_quantity)
+
+    # Determine if adding or removing stock
+    is_add = quantity > 0
+
+    # Update product stock
+    if is_add:
+        product.stock_quantity = Decimal(str(product.stock_quantity)) + Decimal(str(abs_quantity))
+    else:
+        product.stock_quantity = Decimal(str(product.stock_quantity)) - Decimal(str(abs_quantity))
+
+    # Validate stock doesn't go negative
+    if float(product.stock_quantity) < 0:
+        raise ValueError(f'Cannot adjust stock for product "{product.name}". Stock would go negative.')
+
+    product.save(update_fields=['stock_quantity'])
+
+    # Determine movement type for the record
+    if movement_type == 'return':
+        move_type = 'in'
+    elif movement_type == 'exchange':
+        move_type = 'out'
+    else:
+        move_type = 'adjustment'
+
+    # Create stock movement record
+    StockMovement.objects.create(
+        product=product,
+        movement_type=move_type,
+        quantity=abs_quantity if is_add else -abs_quantity,
+        reason=f'{reference}',
+        user=cashier
+    )
+
+    # Log the operation
+    log_stock_operation(
+        user=cashier,
+        operation='stock_adjustment',
+        product=product,
+        description=f'Stock {movement_type}: {abs_quantity} units - {reference}',
+        old_values={'stock_quantity': old_quantity},
+        new_values={'stock_quantity': float(product.stock_quantity)},
+        request=None
     )

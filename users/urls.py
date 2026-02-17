@@ -12,6 +12,7 @@ urlpatterns = [
     path('login/', views.LoginView.as_view(), name='login'),
     path('refresh/', views.RefreshView.as_view(), name='refresh'),
     path('logout/', views.LogoutView.as_view(), name='logout'),
+    path('me/', views.CurrentUserView.as_view(), name='current-user'),
 
     # Roles endpoint (give it a path, not '')
     path('roles/', views.RoleListView.as_view(), name='roles'),

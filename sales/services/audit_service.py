@@ -1,6 +1,32 @@
 from ..models import AuditLog
 
 
+def log_action(user, action, details, request=None):
+    """
+    Log a general action with user attribution
+    Simplified version for basic action logging
+    """
+    try:
+        audit_log = AuditLog.objects.create(
+            user=user,
+            operation=action,
+            entity_type='Return',
+            entity_id=None,
+            description=str(details),
+        )
+        
+        # Add request details if available
+        if request:
+            audit_log.ip_address = get_client_ip(request)
+            audit_log.user_agent = request.META.get('HTTP_USER_AGENT', '')
+            audit_log.save()
+        
+        return audit_log
+    except Exception as e:
+        print(f"Failed to create audit log: {e}")
+        return None
+
+
 def log_operation(user, operation, entity_type, entity_id, description,
                  old_values=None, new_values=None, request=None):
     """

@@ -5,14 +5,20 @@ from decimal import Decimal
 from ..models import Cart, CartItem, Sale, SaleItem
 from ..signals import create_default_payment
 from shifts.models import Shift
+from .receipt_number_service import get_next_receipt_number
 
 
 def get_held_orders(cashier):
     """Get all held orders for the current cashier's shift"""
+    # Return empty list if no cashier provided (no shift started yet)
+    if not cashier:
+        return Cart.objects.none()
+    
     try:
         current_shift = Shift.objects.get(cashier=cashier, status='open')
     except Shift.DoesNotExist:
-        raise ValueError('No active shift found')
+        # No active shift - return empty list instead of raising error
+        return Cart.objects.none()
 
     held_carts = Cart.objects.filter(
         cashier=cashier,
@@ -30,7 +36,7 @@ def complete_held_order(cart, request_data, cashier, current_shift):
     tax_amount = float(request_data.get('tax_amount', 0))
     discount_amount = float(request_data.get('discount_amount', 0))
     total_amount = float(request_data.get('total_amount', subtotal + tax_amount - discount_amount))
-    receipt_number = request_data.get('receipt_number', f'POS-{timezone.now().strftime("%Y%m%d%H%M%S")}')
+    receipt_number = get_next_receipt_number()
 
     # Create sale
     # Temporarily disconnect the signal to prevent duplicate payments
@@ -97,7 +103,7 @@ def create_sale_from_cart(cart, request_data, cashier, current_shift):
     tax_amount = float(request_data.get('tax_amount', 0))
     discount_amount = float(request_data.get('discount_amount', 0))
     total_amount = float(request_data.get('total_amount', subtotal + tax_amount - discount_amount))
-    receipt_number = request_data.get('receipt_number', f'POS-{timezone.now().strftime("%Y%m%d%H%M%S")}')
+    receipt_number = get_next_receipt_number()
 
     # Create sale
     # Temporarily disconnect the signal to prevent duplicate payments

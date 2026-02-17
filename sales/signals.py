@@ -1,6 +1,6 @@
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
-from .models import Sale
+from .models import Sale, Return
 from payments.models import Payment
 
 @receiver(post_save, sender=Sale)
@@ -24,3 +24,33 @@ def create_default_payment(sender, instance, created, **kwargs):
             status='completed',
             description='Auto-generated default payment'
         )
+
+@receiver(post_save, sender=Return)
+def update_shift_return_totals(sender, instance, created, **kwargs):
+    """
+    Update shift return totals when a return is created or modified.
+    """
+    from shifts.models import Shift
+    
+    sale = instance.sale
+    if sale and sale.shift:
+        try:
+            shift = Shift.objects.get(id=sale.shift.id)
+            shift.update_return_totals()
+        except Shift.DoesNotExist:
+            pass
+
+@receiver(post_delete, sender=Return)
+def update_shift_return_totals_on_delete(sender, instance, **kwargs):
+    """
+    Update shift return totals when a return is deleted.
+    """
+    from shifts.models import Shift
+    
+    sale = instance.sale
+    if sale and sale.shift:
+        try:
+            shift = Shift.objects.get(id=sale.shift.id)
+            shift.update_return_totals()
+        except Shift.DoesNotExist:
+            pass

@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/roles/', include('users.urls')),
     path('api/products/', ProductViewSet.as_view({'get': 'list', 'post': 'create'})),
     path('api/products/<int:pk>/', ProductViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
+    # Main API router (includes sales URLs - carts, sales, invoices, returns, etc.)
     path('api/', include('sales.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/customers/', include('customers.urls')),
@@ -50,4 +51,6 @@ urlpatterns = [
     path('api/inventory/', include('inventory.urls')),
     path('api/', include('suppliers.urls')),
     path('api/integrations/', include('integrations.urls')),
+    path('api/etims/', include('etims.urls')),
+    path('api/accounting/', include('accounting.urls')),
 ]
