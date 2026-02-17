@@ -49,7 +49,7 @@ INSTALLED_APPS = [
     'shifts',
     'reports',
     'branches',
-    'etims',
+    # 'etims',  # Temporarily disabled for Vercel
     'accounting',
 ]
 

@@ -51,6 +51,6 @@ urlpatterns = [
     path('api/inventory/', include('inventory.urls')),
     path('api/', include('suppliers.urls')),
     path('api/integrations/', include('integrations.urls')),
-    path('api/etims/', include('etims.urls')),
+    # path('api/etims/', include('etims.urls')),  # Temporarily disabled for Vercel
     path('api/accounting/', include('accounting.urls')),
 ]
