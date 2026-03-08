@@ -31,7 +31,11 @@ def validate_stock_availability(cart_items):
         actual_available = sum(batch.quantity for batch in available_batches)
         
         # Use actual batch stock if available, otherwise fall back to product.stock_quantity
-        available_stock = max(actual_available, float(product.stock_quantity)) if actual_available > 0 else float(product.stock_quantity)
+        # If batches exist with stock, use that. If no batches, use product.stock_quantity
+        if actual_available > 0:
+            available_stock = actual_available
+        else:
+            available_stock = float(product.stock_quantity)
         
         if available_stock < requested_quantity:
             raise ValueError(f'Insufficient stock for product "{product.name}". Available: {int(available_stock)}, Requested: {requested_quantity}')

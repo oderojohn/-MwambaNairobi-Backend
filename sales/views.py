@@ -311,6 +311,112 @@ class SaleViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'])
+    def update_held_order(self, request, pk=None):
+        """Update a held order (add/remove items)"""
+        try:
+            cart = Cart.objects.get(id=pk, status='held')
+        except Cart.DoesNotExist:
+            return Response(
+                {'error': 'Held order not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check if cashier has permission to update this order
+        cashier = None
+        if hasattr(request.user, 'userprofile'):
+            cashier = request.user.userprofile
+
+        # Allow update if user is admin or is the cashier who created the order
+        if not cashier or (cart.cashier and cart.cashier != cashier):
+            # Check if user is admin
+            if not request.user.is_staff and not request.user.is_superuser:
+                return Response(
+                    {'error': 'Unauthorized to update this order'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        # Get items to add/remove
+        items_to_add = request.data.get('items_to_add', [])
+        items_to_remove = request.data.get('items_to_remove', [])  # List of item IDs
+        update_quantities = request.data.get('update_quantities', {})  # {item_id: new_quantity}
+
+        try:
+            # Remove items if specified
+            if items_to_remove:
+                # Convert to integers
+                item_ids = [int(x) for x in items_to_remove if str(x).isdigit()]
+                cart.cartitem_set.filter(id__in=item_ids).delete()
+
+            # Update quantities if specified
+            if update_quantities:
+                for item_id, new_qty in update_quantities.items():
+                    try:
+                        cart_item = cart.cartitem_set.get(id=int(item_id))
+                        if int(new_qty) <= 0:
+                            cart_item.delete()
+                        else:
+                            cart_item.quantity = int(new_qty)
+                            cart_item.save()
+                    except (CartItem.DoesNotExist, ValueError):
+                        pass
+
+            # Add new items if specified
+            if items_to_add:
+                for item_data in items_to_add:
+                    product_id = item_data.get('product')
+                    quantity = int(item_data.get('quantity', 1))
+                    unit_price = item_data.get('unit_price')
+
+                    try:
+                        product = Product.objects.get(id=int(product_id))
+                        # Check if product already exists in cart
+                        existing_item = cart.cartitem_set.filter(product=product).first()
+                        if existing_item:
+                            # Update quantity
+                            existing_item.quantity += quantity
+                            if unit_price:
+                                existing_item.unit_price = float(unit_price)
+                            existing_item.save()
+                        else:
+                            # Add new item
+                            CartItem.objects.create(
+                                cart=cart,
+                                product=product,
+                                quantity=quantity,
+                                unit_price=float(unit_price) if unit_price else product.selling_price
+                            )
+                    except (Product.DoesNotExist, ValueError):
+                        pass
+
+            # Reload cart to get updated items
+            cart_items = cart.cartitem_set.select_related('product')
+            updated_items = []
+            for item in cart_items:
+                updated_items.append({
+                    'id': item.id,
+                    'product': item.product.id,
+                    'product_name': item.product.name,
+                    'quantity': item.quantity,
+                    'unit_price': str(item.unit_price),
+                    'total': str(item.unit_price * item.quantity)
+                })
+
+            # Calculate new total (convert to float first)
+            new_total = sum(float(item['unit_price']) * item['quantity'] for item in updated_items)
+
+            return Response({
+                'message': 'Held order updated successfully',
+                'items': updated_items,
+                'total': str(new_total)
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to update held order: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=True, methods=['post'])
     def void_sale(self, request, pk=None):
         """Void a completed sale with a reason"""
         try:
@@ -1470,7 +1576,23 @@ class SaleViewSet(viewsets.ModelViewSet):
                 # Get customer if provided (needed for wholesale validation)
                 customer_id = request.data.get('customer')
 
-                # Validate stock availability
+                # If this is a hold order, skip stock validation and don't create sale
+                # Stock will only be validated and deducted when the order is completed
+                if is_hold_order:
+                    # Save cart as hold order
+                    cart.status = 'held'
+                    cart.save()
+                    
+                    # Return success response for hold order
+                    return Response({
+                        'id': cart.id,
+                        'message': 'Order held successfully',
+                        'cart_id': cart.id,
+                        'status': 'held',
+                        'items': CartItemSerializer(cart.cartitem_set.all(), many=True).data
+                    }, status=status.HTTP_201_CREATED)
+
+                # Validate stock availability for regular sales
                 try:
                     stock_deductions = stock_service.validate_stock_availability(cart_items)
                 except ValueError as e:
@@ -1626,25 +1748,26 @@ class ReturnViewSet(viewsets.ModelViewSet):
             'shift'
         ).select_related('sale__customer')
         
-        # Handle shift_id filter explicitly
+        # Handle shift_id filter explicitly - apply to ALL users including admins
         shift_id = self.request.query_params.get('shift_id')
         user_id = self.request.query_params.get('user_id')
         
-        # For admin users, show all returns; for regular users, filter by their returns
-        if not self.request.user.is_staff:
-            if shift_id:
-                queryset = queryset.filter(shift_id=shift_id)
-            elif user_id:
-                queryset = queryset.filter(shift__cashier__user_id=user_id)
-            # Otherwise, filter by current user's returns via their profile
-            elif hasattr(self.request.user, 'userprofile'):
+        # If shift_id is provided, filter by it (applies to everyone)
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+        # If user_id is provided, filter by user
+        elif user_id:
+            queryset = queryset.filter(shift__cashier__user_id=user_id)
+        # For non-admin users without shift_id, filter by their returns
+        elif not self.request.user.is_staff:
+            if hasattr(self.request.user, 'userprofile'):
                 try:
                     from users.models import UserProfile
                     user_profile = self.request.user.userprofile
                     queryset = queryset.filter(processed_by=user_profile)
                 except:
                     pass
-        # Admin users see all returns
+        # Admin users without shift_id see all returns
         
         return queryset
 

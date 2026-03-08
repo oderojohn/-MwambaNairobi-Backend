@@ -445,6 +445,15 @@ class SalesSummaryView(generics.GenericAPIView):
         # Net profit (estimated as gross profit minus 5% operating costs)
         net_profit = gross_profit * 0.95
 
+        # Get returns for the shift
+        from sales.models import Return
+        shift_returns = Return.objects.filter(shift_id=shift_id)
+        total_returns = sum(float(ret.total_refund_amount) for ret in shift_returns)
+        return_transactions = shift_returns.count()
+
+        # Net sales = total sales - total returns
+        net_sales = total_sales - total_returns
+
         # Get all completed sales for the shift with payment info (exclude voided)
         all_sales = Sale.objects.filter(
             shift_id=shift_id,
@@ -479,6 +488,9 @@ class SalesSummaryView(generics.GenericAPIView):
 
         result = {
             'total_sales': total_sales,
+            'total_returns': total_returns,
+            'return_transactions': return_transactions,
+            'net_sales': net_sales,
             'total_transactions': total_transactions,
             'average_sale': total_sales / total_transactions if total_transactions > 0 else 0,
             'today_sales': total_sales,  # Since it's for the shift
@@ -1354,7 +1366,7 @@ class SalesSummaryView(generics.GenericAPIView):
 
     def _get_sales_data_for_range(self, date_from, date_to):
         """Get sales data for the specified date range (for reports)"""
-        from sales.models import Sale, SaleItem
+        from sales.models import Sale, SaleItem, Return
         from payments.models import Payment
 
         sales = Sale.objects.filter(
@@ -1366,6 +1378,25 @@ class SalesSummaryView(generics.GenericAPIView):
             total_sales=Sum('final_amount'),
             transaction_count=Count('id')
         ).order_by('date')
+
+        # Get returns for the date range
+        returns = Return.objects.filter(
+            return_date__date__range=[date_from, date_to]
+        ).annotate(
+            date=TruncDate('return_date')
+        ).values('date').annotate(
+            total_returns=Sum('total_refund_amount'),
+            return_count=Count('id')
+        ).order_by('date')
+
+        # Create a dictionary of returns by date
+        returns_by_date = {}
+        for ret in returns:
+            date_key = ret['date'].strftime('%Y-%m-%d')
+            returns_by_date[date_key] = {
+                'total_returns': float(ret['total_returns'] or 0),
+                'return_count': ret['return_count']
+            }
 
         # Get payment method breakdown per day
         payments_per_day = Payment.objects.filter(
@@ -1410,6 +1441,9 @@ class SalesSummaryView(generics.GenericAPIView):
             result.append({
                 'date': date_str,
                 'total_sales': float(sale['total_sales']),
+                'total_returns': returns_by_date.get(date_str, {}).get('total_returns', 0),
+                'return_transactions': returns_by_date.get(date_str, {}).get('return_count', 0),
+                'net_sales': float(sale['total_sales']) - returns_by_date.get(date_str, {}).get('total_returns', 0),
                 'cash_sales': float(day_payments.get('cash', 0)),
                 'card_sales': float(day_payments.get('card', 0)),
                 'mobile_sales': float(day_payments.get('mpesa', 0)),
