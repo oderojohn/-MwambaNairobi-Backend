@@ -18,6 +18,7 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import JsonResponse
 from suppliers.views import SupplierPriceHistoryViewSet
 from inventory.views import ProductViewSet
 from repairs.views import RepairViewSet
@@ -25,7 +26,18 @@ from preorders.views import PreorderViewSet
 from shifts.views import ShiftViewSet
 from branches.views import BranchViewSet
 
+
+def health_check(request):
+    return JsonResponse({
+        'status': 'ok',
+        'service': 'mwamba-nairobi-backend',
+        'admin_url': '/admin/',
+        'api_base': '/api/',
+    })
+
 urlpatterns = [
+    path('', health_check, name='health-root'),
+    path('health/', health_check, name='health-check'),
     path('admin/', admin.site.urls),
     path('api/users/', include('users.urls')),
     # Keep auth endpoints exposed under /api/auth/ for existing clients

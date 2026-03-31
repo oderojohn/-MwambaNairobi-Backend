@@ -133,7 +133,8 @@ USE_TZ = True
 # ✅ Static & media files
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_DIRS = [BASE_DIR / 'static']  # Additional static files location
+STATIC_SOURCE_DIR = BASE_DIR / 'static'
+STATICFILES_DIRS = [STATIC_SOURCE_DIR] if STATIC_SOURCE_DIR.exists() else []
 
 STORAGES = {
     'default': {
