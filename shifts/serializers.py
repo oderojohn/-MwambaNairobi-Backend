@@ -5,6 +5,8 @@ from django.db.models import Q
 
 class ShiftSerializer(serializers.ModelSerializer):
     cashier_name = serializers.SerializerMethodField()
+    cashier_role = serializers.SerializerMethodField()
+    waiter_name = serializers.SerializerMethodField()
     approved_by_name = serializers.SerializerMethodField()
     transaction_count = serializers.SerializerMethodField()
     expected_cash = serializers.SerializerMethodField()
@@ -23,7 +25,7 @@ class ShiftSerializer(serializers.ModelSerializer):
             'closing_balance', 'cash_sales', 'card_sales', 'mobile_sales',
             'total_sales', 'total_returns', 'return_count', 'net_sales',
             'status', 'discrepancy', 'approved_by',
-            'cashier_name', 'approved_by_name', 'transaction_count', 'expected_cash', 'actual_cash', 'notes', 'sales', 'returns',
+            'cashier_name', 'cashier_role', 'waiter_name', 'approved_by_name', 'transaction_count', 'expected_cash', 'actual_cash', 'notes', 'sales', 'returns',
             'has_active_shift', 'last_shift_info'
         ]
 
@@ -53,6 +55,18 @@ class ShiftSerializer(serializers.ModelSerializer):
             return 0
 
     def get_cashier_name(self, obj):
+        try:
+            return obj.cashier.user.username
+        except:
+            return None
+
+    def get_cashier_role(self, obj):
+        try:
+            return obj.cashier.role
+        except:
+            return None
+
+    def get_waiter_name(self, obj):
         try:
             return obj.cashier.user.username
         except:

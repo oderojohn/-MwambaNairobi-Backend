@@ -8,8 +8,8 @@ from shifts.models import Shift
 from .receipt_number_service import get_next_receipt_number
 
 
-def get_held_orders(cashier):
-    """Get all held orders for the current cashier's shift"""
+def get_held_orders(cashier, status_filter='held'):
+    """Get held or voided orders for the current cashier's shift"""
     # Return empty list if no cashier provided (no shift started yet)
     if not cashier:
         return Cart.objects.none()
@@ -22,7 +22,7 @@ def get_held_orders(cashier):
 
     held_carts = Cart.objects.filter(
         cashier=cashier,
-        status='held'
+        status=status_filter
     ).prefetch_related('cartitem_set__product').order_by('-created_at')
 
     return held_carts

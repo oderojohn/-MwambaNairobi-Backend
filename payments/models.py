@@ -5,7 +5,9 @@ from django.db import models
 class Payment(models.Model):
     PAYMENT_TYPES = [
         ('cash', 'Cash'),
+        ('card', 'Card'),
         ('mpesa', 'MPesa'),
+        ('bank_transfer', 'Bank Transfer'),
         ('split', 'Split'),
     ]
 

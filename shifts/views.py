@@ -2,6 +2,7 @@ from rest_framework import viewsets, generics, status, serializers
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models import Prefetch
@@ -49,6 +50,11 @@ class ShiftViewSet(viewsets.ModelViewSet):
         # Filter by date range if provided
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
+        # Accept shorthand start/end to align with frontend filters
+        start_fallback = self.request.query_params.get('start')
+        end_fallback = self.request.query_params.get('end')
+        start_date = start_date or start_fallback
+        end_date = end_date or end_fallback
         
         if start_date:
             queryset = queryset.filter(start_time__date__gte=start_date)
@@ -408,6 +414,14 @@ class AllShiftsView(generics.ListAPIView):
         user_id = self.request.query_params.get('user_id')
         if user_id:
             queryset = queryset.filter(cashier__user_id=user_id)
+
+        username = self.request.query_params.get('user') or self.request.query_params.get('username')
+        if username:
+            queryset = queryset.filter(cashier__user__username__icontains=username)
+
+        role_param = self.request.query_params.get('role')
+        if role_param:
+            queryset = queryset.filter(cashier__role=role_param)
         
         # Filter by cashier (UserProfile ID)
         cashier_id = self.request.query_params.get('cashier_id')
@@ -416,8 +430,20 @@ class AllShiftsView(generics.ListAPIView):
         
         # Filter by status
         status_param = self.request.query_params.get('status')
+        include_all_shifts = str(self.request.query_params.get('all_shifts', '')).lower() in ['1', 'true', 'yes']
         if status_param:
             queryset = queryset.filter(status=status_param)
+        elif include_all_shifts:
+            recent_closed_ids = list(
+                queryset.filter(status='closed')
+                .order_by('-start_time')
+                .values_list('id', flat=True)[:5]
+            )
+            queryset = queryset.filter(
+                Q(status='open') | Q(id__in=recent_closed_ids)
+            )
+        else:
+            queryset = queryset.filter(status='open')
         
         # Filter by date range
         start_date = self.request.query_params.get('start_date')

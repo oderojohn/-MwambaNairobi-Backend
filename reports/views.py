@@ -102,10 +102,12 @@ class ReportViewSet(viewsets.ModelViewSet):
         from sales.models import Sale, Payment, SaleItem
         from django.db.models import Case, When, DecimalField
 
-        sales = Sale.objects.filter(
+        sales_queryset = queryset if queryset is not None else Sale.objects.filter(
             sale_date__date__range=[date_from, date_to],
             voided=False
-        ).annotate(
+        )
+
+        sales = sales_queryset.annotate(
             date=TruncDate('sale_date')
         ).values('date').annotate(
             total_sales=Sum('final_amount'),
@@ -114,8 +116,7 @@ class ReportViewSet(viewsets.ModelViewSet):
 
         # Get payment method breakdown per day
         payments_per_day = Payment.objects.filter(
-            sale__sale_date__date__range=[date_from, date_to],
-            sale__voided=False,
+            sale__in=sales_queryset,
             status='completed'
         ).annotate(
             date=TruncDate('sale__sale_date')
@@ -138,7 +139,7 @@ class ReportViewSet(viewsets.ModelViewSet):
 
             # Calculate actual gross profit and cost of goods sold for the day
             sales_items_for_day = SaleItem.objects.filter(
-                sale__sale_date__date=sale['date'],
+                sale__in=sales_queryset.filter(sale_date__date=sale['date']),
                 sale__voided=False
             ).select_related('product')
 
@@ -378,6 +379,46 @@ class ReportViewSet(viewsets.ModelViewSet):
 class SalesSummaryView(generics.GenericAPIView):
     """Get sales summary for dashboard and reports"""
 
+    def _get_request_role(self, request):
+        if not getattr(request.user, 'is_authenticated', False):
+            return None
+        profile = getattr(request.user, 'userprofile', None)
+        return getattr(profile, 'role', None)
+
+    def _can_view_team_sales(self, request):
+        role = self._get_request_role(request)
+        return role in ['admin', 'manager', 'supervisor'] or request.user.is_staff or request.user.is_superuser
+
+    def _build_sales_queryset(self, request, date_from=None, date_to=None, all_users=False, username=None, shift_id=None):
+        from sales.models import Sale
+
+        queryset = Sale.objects.filter(voided=False)
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+        if date_from and date_to:
+            queryset = queryset.filter(sale_date__date__range=[date_from, date_to])
+        elif date_from:
+            queryset = queryset.filter(sale_date__date__gte=date_from)
+        elif date_to:
+            queryset = queryset.filter(sale_date__date__lte=date_to)
+
+        role = self._get_request_role(request)
+        profile = getattr(request.user, 'userprofile', None)
+
+        if all_users:
+            if not self._can_view_team_sales(request):
+                return Sale.objects.none()
+        elif profile is not None and role == 'supervisor' and not shift_id and not username:
+            # Keep the default supervisor view personal, but allow direct
+            # inspection of other users' summaries when a shift or user filter
+            # is explicitly requested from the UI.
+            queryset = queryset.filter(shift__cashier=profile)
+
+        if username:
+            queryset = queryset.filter(shift__cashier__user__username__icontains=username)
+
+        return queryset
+
     def _get_shift_sales_data(self, shift_id):
         """Get sales data for a specific shift"""
         from sales.models import Sale, Cart
@@ -570,19 +611,18 @@ class SalesSummaryView(generics.GenericAPIView):
 
         return result
 
-    def _get_all_sales_data(self):
+    def _get_all_sales_data(self, queryset=None):
         """Get all sales data (not restricted to a shift)"""
         from sales.models import Sale, SaleItem
         from payments.models import Payment
 
         # Get all completed sales (exclude voided sales for totals)
-        sales = Sale.objects.filter(
-            voided=False
-        ).select_related('customer').prefetch_related('payment_set', 'saleitem_set__product').order_by('-sale_date')[:1000]  # Limit to last 1000 sales for performance
+        sales_queryset = queryset if queryset is not None else Sale.objects.filter(voided=False)
+        sales = sales_queryset.select_related('customer').prefetch_related('payment_set', 'saleitem_set__product').order_by('-sale_date')[:1000]  # Limit to last 1000 sales for performance
 
         # Get payment method breakdown
         payments = Payment.objects.filter(
-            sale__voided=False,
+            sale__in=sales_queryset,
             status='completed'
         ).select_related('sale')
 
@@ -641,10 +681,14 @@ class SalesSummaryView(generics.GenericAPIView):
                     'mpesa_number': sale.payment_set.filter(payment_type='mpesa', status='completed').first().mpesa_number if sale.payment_set.filter(payment_type='mpesa', status='completed').exists() else None,
                     'items': [
                         {
+                            'id': item.id,
                             'product_name': item.product.name,
                             'quantity': item.quantity,
                             'unit_price': float(item.unit_price),
-                            'total': float(item.unit_price * item.quantity)
+                            'total': float(item.unit_price * item.quantity),
+                            'returned_quantity': item.returned_quantity,
+                            'remaining_quantity': item.remaining_quantity,
+                            'is_fully_returned': item.is_fully_returned
                         }
                         for item in sale.saleitem_set.all()
                     ],
@@ -892,6 +936,26 @@ class SalesSummaryView(generics.GenericAPIView):
         if sale_id:
             chit_details = self._get_sale_chit_details(sale_id)
             return Response(chit_details)
+
+        all_users = str(request.query_params.get('all_users', '')).lower() in ['1', 'true', 'yes']
+        username = request.query_params.get('user')
+        date_from = request.query_params.get('date_from') or request.query_params.get('start')
+        date_to = request.query_params.get('date_to') or request.query_params.get('end')
+        shift_id = request.query_params.get('shift_id')
+
+        if all_users:
+            if not self._can_view_team_sales(request):
+                return Response({'error': 'Admin, manager, or supervisor role required for team sales'}, status=status.HTTP_403_FORBIDDEN)
+            sales_queryset = self._build_sales_queryset(
+                request,
+                date_from=date_from,
+                date_to=date_to,
+                all_users=True,
+                username=username,
+                shift_id=shift_id
+            )
+            sales_data = self._get_all_sales_data(queryset=sales_queryset)
+            return Response(sales_data)
 
         # Check if detailed transactions are requested
         if request.query_params.get('detailed_transactions'):
@@ -1364,15 +1428,17 @@ class SalesSummaryView(generics.GenericAPIView):
             ]
         }
 
-    def _get_sales_data_for_range(self, date_from, date_to):
+    def _get_sales_data_for_range(self, date_from, date_to, queryset=None):
         """Get sales data for the specified date range (for reports)"""
         from sales.models import Sale, SaleItem, Return
         from payments.models import Payment
 
-        sales = Sale.objects.filter(
+        sales_queryset = queryset if queryset is not None else Sale.objects.filter(
             sale_date__date__range=[date_from, date_to],
             voided=False
-        ).annotate(
+        )
+
+        sales = sales_queryset.annotate(
             date=TruncDate('sale_date')
         ).values('date').annotate(
             total_sales=Sum('final_amount'),
@@ -1381,7 +1447,8 @@ class SalesSummaryView(generics.GenericAPIView):
 
         # Get returns for the date range
         returns = Return.objects.filter(
-            return_date__date__range=[date_from, date_to]
+            return_date__date__range=[date_from, date_to],
+            sale__in=sales_queryset
         ).annotate(
             date=TruncDate('return_date')
         ).values('date').annotate(
@@ -1400,8 +1467,7 @@ class SalesSummaryView(generics.GenericAPIView):
 
         # Get payment method breakdown per day
         payments_per_day = Payment.objects.filter(
-            sale__sale_date__date__range=[date_from, date_to],
-            sale__voided=False,
+            sale__in=sales_queryset,
             status='completed'
         ).annotate(
             date=TruncDate('sale__sale_date')
@@ -1423,7 +1489,7 @@ class SalesSummaryView(generics.GenericAPIView):
             day_payments = payments_by_date.get(date_str, {})
             # Calculate actual gross profit for the day
             sales_items_for_day = SaleItem.objects.filter(
-                sale__sale_date__date=sale['date'],
+                sale__in=sales_queryset.filter(sale_date__date=sale['date']),
                 sale__voided=False
             ).select_related('product')
 
@@ -2480,9 +2546,18 @@ class ReturnsSummaryView(generics.GenericAPIView):
         date_to = request.query_params.get('date_to')
         shift_id = request.query_params.get('shift_id')
         user_id = request.query_params.get('user_id')
+        all_users = str(request.query_params.get('all_users', '')).lower() in ['1', 'true', 'yes']
+        username = request.query_params.get('user')
+        request_role = getattr(getattr(request.user, 'userprofile', None), 'role', None)
         
         # Build queryset
         returns_query = Return.objects.all()
+
+        if all_users:
+            if request_role not in ['admin', 'manager', 'supervisor'] and not request.user.is_staff and not request.user.is_superuser:
+                return Response({'error': 'Admin, manager, or supervisor role required for team returns'}, status=status.HTTP_403_FORBIDDEN)
+            if username:
+                returns_query = returns_query.filter(shift__cashier__user__username__icontains=username)
         
         # If shift_id is provided, filter by the return's shift (when return was processed)
         if shift_id:

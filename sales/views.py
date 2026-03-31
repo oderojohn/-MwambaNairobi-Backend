@@ -76,35 +76,50 @@ class SaleViewSet(viewsets.ModelViewSet):
         print(f"[DEBUG] Serialized items: {data.get('items', 'NO ITEMS FIELD')}")
         return Response(data)
 
+    def _ensure_owner_or_admin(self, sale, user):
+        """
+        Enforce that only the sale owner (cashier) or admin/manager can mutate a sale.
+        """
+        if not hasattr(user, 'userprofile'):
+            return False
+        if user.is_staff or user.userprofile.role in ['admin', 'manager']:
+            return True
+        # If same cashier, allow
+        return sale.shift and sale.shift.cashier_id == user.userprofile.id
+
     @action(detail=False, methods=['get'])
     def held_orders(self, request):
-        """Get all held orders for the current cashier's shift"""
-        cashier = None
-        if hasattr(request.user, 'userprofile'):
-            cashier = request.user.userprofile
+        """Get held orders for the current cashier or supervisor view for waiters."""
+        cashier = getattr(request.user, 'userprofile', None)
 
-        # If no cashier/user, return empty list instead of error
         if not cashier:
             return Response([])
 
+        role = getattr(cashier, 'role', None)
+        show_waiter_orders = str(request.query_params.get('all_waiters', '')).lower() in ['1', 'true', 'yes']
+        status_filter = request.query_params.get('status', 'held')
+
         try:
-            # Check if shift_id is provided
-            shift_id = request.query_params.get('shift_id')
-            if shift_id:
-                # Filter by specific shift ID using the Shift model
-                from shifts.models import Shift
-                try:
-                    shift = Shift.objects.get(id=shift_id, cashier=cashier)
-                    # Cart doesn't have shift field, filter by cashier only for this shift
-                    held_carts = Cart.objects.filter(
-                        cashier=cashier,
-                        status='held'
-                    ).prefetch_related('cartitem_set__product').order_by('-created_at')
-                except Shift.DoesNotExist:
-                    held_carts = Cart.objects.none()
+            if role == 'supervisor' and show_waiter_orders:
+                held_carts = Cart.objects.filter(
+                    Q(cashier__role='waiter', cashier__shift__status='open') |
+                    Q(cashier=cashier),
+                    status=status_filter
+                ).select_related('customer', 'cashier__user').prefetch_related('cartitem_set__product').distinct().order_by('-created_at')
             else:
-                # Default behavior - get held orders for current shift
-                held_carts = sales_service.get_held_orders(cashier)
+                shift_id = request.query_params.get('shift_id')
+                if shift_id:
+                    from shifts.models import Shift
+                    try:
+                        Shift.objects.get(id=shift_id, cashier=cashier)
+                        held_carts = Cart.objects.filter(
+                            cashier=cashier,
+                            status=status_filter
+                        ).prefetch_related('cartitem_set__product').order_by('-created_at')
+                    except Shift.DoesNotExist:
+                        held_carts = Cart.objects.none()
+                else:
+                    held_carts = sales_service.get_held_orders(cashier, status_filter=status_filter)
         except ValueError as e:
             return Response(
                 {'error': str(e)},
@@ -156,7 +171,16 @@ class SaleViewSet(viewsets.ModelViewSet):
         if hasattr(request.user, 'userprofile'):
             cashier = request.user.userprofile
 
-        if not cashier or cart.cashier != cashier:
+        can_manage_held_order = (
+            cashier and (
+                cart.cashier == cashier or
+                request.user.is_staff or
+                request.user.is_superuser or
+                cashier.role in ['admin', 'manager', 'supervisor']
+            )
+        )
+
+        if not can_manage_held_order:
             return Response(
                 {'error': 'Unauthorized to complete this order'},
                 status=status.HTTP_403_FORBIDDEN
@@ -326,14 +350,21 @@ class SaleViewSet(viewsets.ModelViewSet):
         if hasattr(request.user, 'userprofile'):
             cashier = request.user.userprofile
 
-        # Allow update if user is admin or is the cashier who created the order
-        if not cashier or (cart.cashier and cart.cashier != cashier):
-            # Check if user is admin
-            if not request.user.is_staff and not request.user.is_superuser:
-                return Response(
-                    {'error': 'Unauthorized to update this order'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
+        can_manage_held_order = (
+            cashier and (
+                not cart.cashier or
+                cart.cashier == cashier or
+                request.user.is_staff or
+                request.user.is_superuser or
+                cashier.role in ['admin', 'manager', 'supervisor']
+            )
+        )
+
+        if not can_manage_held_order:
+            return Response(
+                {'error': 'Unauthorized to update this order'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         # Get items to add/remove
         items_to_add = request.data.get('items_to_add', [])
@@ -388,6 +419,15 @@ class SaleViewSet(viewsets.ModelViewSet):
                     except (Product.DoesNotExist, ValueError):
                         pass
 
+            customer_id = request.data.get('customer')
+            if customer_id is not None:
+                try:
+                    from customers.models import Customer
+                    cart.customer = Customer.objects.get(id=int(customer_id)) if customer_id else None
+                except (Customer.DoesNotExist, ValueError, TypeError):
+                    cart.customer = None
+                cart.save(update_fields=['customer'])
+
             # Reload cart to get updated items
             cart_items = cart.cartitem_set.select_related('product')
             updated_items = []
@@ -427,11 +467,29 @@ class SaleViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        if not self._ensure_owner_or_admin(sale, request.user):
+            return Response(
+                {'error': 'Not allowed to void items on this sale'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if not self._ensure_owner_or_admin(sale, request.user):
+            return Response(
+                {'error': 'Not allowed to void this sale'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         # Check if sale is already voided
         if sale.voided:
             return Response(
                 {'error': 'Sale is already voided'},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not self._ensure_owner_or_admin(sale, request.user):
+            return Response(
+                {'error': 'Not allowed to void this transaction'},
+                status=status.HTTP_403_FORBIDDEN
             )
 
         void_reason = request.data.get('reason', '').strip()
@@ -476,11 +534,11 @@ class SaleViewSet(viewsets.ModelViewSet):
     # POS Admin Actions
     @action(detail=True, methods=['post'], permission_classes=[])
     def admin_void_sale(self, request, pk=None):
-        """Admin void a completed sale with a reason (requires admin/manager role)"""
-        # Check admin permissions
-        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+        """Admin/supervisor void a completed sale with a reason."""
+        # Check elevated permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager', 'supervisor']:
             return Response(
-                {'error': 'Admin or Manager role required for this action'},
+                {'error': 'Admin, Manager, or Supervisor role required for this action'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -554,10 +612,10 @@ class SaleViewSet(viewsets.ModelViewSet):
         Void specific items from a sale (partial void).
         Restocks the voided items and updates sale/shift totals.
         """
-        # Check admin/manager permissions
-        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager']:
+        # Check elevated permissions
+        if not hasattr(request.user, 'userprofile') or request.user.userprofile.role not in ['admin', 'manager', 'supervisor']:
             return Response(
-                {'error': 'Admin or Manager role required for this action'},
+                {'error': 'Admin, Manager, or Supervisor role required for this action'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -593,8 +651,7 @@ class SaleViewSet(viewsets.ModelViewSet):
 
         try:
             with transaction.atomic():
-                from .models import SaleItem, VoidItem
-                from inventory.models import Product
+                from .models import SaleItem
                 
                 voided_items = []
                 total_void_amount = 0
@@ -618,18 +675,6 @@ class SaleViewSet(viewsets.ModelViewSet):
                     # Calculate void amount
                     void_qty = min(quantity, sale_item.quantity)
                     void_amount = float(sale_item.unit_price) * void_qty
-                    
-                    # Create void item record
-                    void_item = VoidItem.objects.create(
-                        sale=sale,
-                        sale_item=sale_item,
-                        product=sale_item.product,
-                        quantity=void_qty,
-                        unit_price=sale_item.unit_price,
-                        total_amount=void_amount,
-                        reason=void_reason,
-                        voided_by=request.user.userprofile
-                    )
                     
                     # Update sale item to mark as voided
                     sale_item._voided = True
@@ -660,7 +705,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                     )
                     
                     voided_items.append({
-                        'id': void_item.id,
+                        'id': sale_item_id,
                         'product_name': product.name,
                         'quantity': void_qty,
                         'amount': void_amount
@@ -1575,22 +1620,28 @@ class SaleViewSet(viewsets.ModelViewSet):
 
                 # Get customer if provided (needed for wholesale validation)
                 customer_id = request.data.get('customer')
+                customer = None
+                if customer_id:
+                    from customers.models import Customer
+                    try:
+                        customer = Customer.objects.get(id=customer_id, is_active=True)
+                        cart.customer = customer
+                        cart.save(update_fields=['customer'])
+                    except Customer.DoesNotExist:
+                        return Response(
+                            {'error': 'Customer not found or inactive'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
 
                 # If this is a hold order, skip stock validation and don't create sale
                 # Stock will only be validated and deducted when the order is completed
                 if is_hold_order:
                     # Save cart as hold order
                     cart.status = 'held'
-                    cart.save()
+                    cart.save(update_fields=['status'])
                     
                     # Return success response for hold order
-                    return Response({
-                        'id': cart.id,
-                        'message': 'Order held successfully',
-                        'cart_id': cart.id,
-                        'status': 'held',
-                        'items': CartItemSerializer(cart.cartitem_set.all(), many=True).data
-                    }, status=status.HTTP_201_CREATED)
+                    return Response(CartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
                 # Validate stock availability for regular sales
                 try:
@@ -1608,20 +1659,6 @@ class SaleViewSet(viewsets.ModelViewSet):
                 discount_amount = float(request.data.get('discount_amount', 0))
                 total_amount = float(request.data.get('total_amount', subtotal + tax_amount - discount_amount))
                 print(f"Calculated amounts - subtotal: {subtotal}, total: {total_amount}")
-
-                # Get customer if provided
-                customer = None
-                if customer_id:
-                    from customers.models import Customer
-                    try:
-                        customer = Customer.objects.get(id=customer_id, is_active=True)
-                        cart.customer = customer
-                        cart.save()
-                    except Customer.DoesNotExist:
-                        return Response(
-                            {'error': 'Customer not found or inactive'},
-                            status=status.HTTP_400_BAD_REQUEST
-                        )
 
                 # If this is a hold order, don't create sale or deduct stock
                 if is_hold_order:
@@ -1786,6 +1823,22 @@ class ReturnViewSet(viewsets.ModelViewSet):
                         {'error': 'Sale not found'},
                         status=status.HTTP_404_NOT_FOUND
                     )
+
+                # Only allow returns for sales within the last 7 days
+                seven_days_ago = timezone.now() - timezone.timedelta(days=7)
+                if sale.sale_date < seven_days_ago:
+                    return Response(
+                        {'error': 'Returns are limited to the past 7 days'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # If user is not admin/manager, enforce ownership
+                if not (request.user.is_staff or (hasattr(request.user, 'userprofile') and request.user.userprofile.role in ['admin', 'manager'])):
+                    if not (sale.shift and hasattr(request.user, 'userprofile') and sale.shift.cashier_id == request.user.userprofile.id):
+                        return Response(
+                            {'error': 'Not allowed to process returns for other users'},
+                            status=status.HTTP_403_FORBIDDEN
+                        )
 
                 # Get the cashier - check if user is admin
                 is_admin = request.user.is_staff

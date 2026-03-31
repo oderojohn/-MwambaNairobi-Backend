@@ -16,9 +16,10 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
 from suppliers.views import SupplierPriceHistoryViewSet
 from inventory.views import ProductViewSet
-from customers.views import CustomerViewSet
 from repairs.views import RepairViewSet
 from preorders.views import PreorderViewSet
 from shifts.views import ShiftViewSet
@@ -27,16 +28,14 @@ from branches.views import BranchViewSet
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/users/', include('users.urls')),
+    # Keep auth endpoints exposed under /api/auth/ for existing clients
     path('api/auth/', include('users.urls')),
-    path('api/roles/', include('users.urls')),
     path('api/products/', ProductViewSet.as_view({'get': 'list', 'post': 'create'})),
     path('api/products/<int:pk>/', ProductViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
     # Main API router (includes sales URLs - carts, sales, invoices, returns, etc.)
     path('api/', include('sales.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/customers/', include('customers.urls')),
-    path('api/customers/', CustomerViewSet.as_view({'get': 'list', 'post': 'create'})),
-    path('api/customers/<int:pk>/', CustomerViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
     path('api/repairs/', RepairViewSet.as_view({'get': 'list', 'post': 'create'})),
     path('api/repairs/<int:pk>/', RepairViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'})),
     path('api/repairs/<int:pk>/parts/', include('repairs.urls')),
@@ -54,3 +53,8 @@ urlpatterns = [
     # path('api/etims/', include('etims.urls')),  # Temporarily disabled for Vercel
     path('api/accounting/', include('accounting.urls')),
 ]
+
+# Serve static files in development
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

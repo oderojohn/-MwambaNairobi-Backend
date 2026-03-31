@@ -13,6 +13,7 @@ class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(source='cartitem_set', many=True, read_only=True)
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     cashier_name = serializers.CharField(source='cashier.user.username', read_only=True)
+    cashier_role = serializers.CharField(source='cashier.role', read_only=True)
 
     class Meta:
         model = Cart

@@ -14,9 +14,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-l3=-3j*)d(#jtqqncm77#ez99litg9zj_pg32)jywlm&i%b1m)')
-DEBUG = os.environ.get('DEBUG', 'True') == 'True'
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['.vercel.app', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        'ALLOWED_HOSTS',
+        '.vercel.app,localhost,127.0.0.1,0.0.0.0,10.63.203.53'
+    ).split(',')
+    if host.strip()
+]
 
 # Installed apps
 INSTALLED_APPS = [
@@ -56,6 +63,7 @@ INSTALLED_APPS = [
 # Middleware
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -88,19 +96,19 @@ WSGI_APPLICATION = 'myshop.wsgi.application'
 
 # ✅ Database (SQLite for now, switchable to Postgres later)
 
-DATABASES = {
-    'default': dj_database_url.parse(
-        'postgresql://neondb_owner:npg_6zcA5DHaPqdL@ep-curly-dust-adhlqx3r-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
-        conn_max_age=600,
-        ssl_require=True
-    )
-}
 # DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': BASE_DIR / 'db.sqlite3',
-#     }
+#     'default': dj_database_url.parse(
+#         'postgresql://neondb_owner:npg_6zcA5DHaPqdL@ep-curly-dust-adhlqx3r-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
+#         conn_max_age=600,
+#         ssl_require=True
+#     )
 # }
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -119,6 +127,16 @@ USE_TZ = True
 # ✅ Static & media files
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_DIRS = [BASE_DIR / 'static']  # Additional static files location
+
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
@@ -161,6 +179,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3001",        # added
     "http://192.168.10.219:3001",   # added
     "https://mwambaliquor.netlify.app",  # added
+    "http://192.168.0.110:3000"
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -173,6 +192,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:3001",
     "https://mwambaliquor.netlify.app",  # added
+    "http://192.168.0.110:3000"
 ]
 
 # ✅ Security best practices
