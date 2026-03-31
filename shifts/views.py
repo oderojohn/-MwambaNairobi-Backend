@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 from .models import Shift
 from .serializers import ShiftSerializer
 from sales.models import Sale
+from users.audit import log_user_activity
 
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.prefetch_related(
@@ -208,6 +209,16 @@ class StartShiftView(generics.CreateAPIView):
         )
         
         logger.info(f"[StartShift] Created shift: {shift.id}")
+        log_user_activity(
+            action='shift_started',
+            user=request.user,
+            request=request,
+            status_code=status.HTTP_201_CREATED,
+            metadata={
+                'shift_id': shift.id,
+                'opening_balance': float(opening_balance or 0),
+            },
+        )
         return Response(
             ShiftSerializer(shift).data,
             status=status.HTTP_201_CREATED
@@ -363,6 +374,13 @@ class EndShiftView(generics.GenericAPIView):
             'discrepancy_description': discrepancy_description,
             'end_time': instance.end_time.isoformat() if instance.end_time else None,
         }
+        log_user_activity(
+            action='shift_closed',
+            user=request.user if getattr(request.user, 'is_authenticated', False) else None,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata=reconciliation,
+        )
         
         return Response(
             {

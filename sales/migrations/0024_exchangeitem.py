@@ -11,15 +11,4 @@ class Migration(migrations.Migration):
         ('sales', '0023_saleitem_returned_quantity'),
     ]
 
-    operations = [
-        migrations.CreateModel(
-            name='ExchangeItem',
-            fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('quantity', models.PositiveIntegerField()),
-                ('unit_price', models.DecimalField(decimal_places=2, max_digits=10)),
-                ('product', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to='inventory.product')),
-                ('return_record', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='exchange_items', to='sales.return')),
-            ],
-        ),
-    ]
+    operations = []

@@ -9,10 +9,4 @@ class Migration(migrations.Migration):
         ('suppliers', '0007_add_purchaseorder_created_at_updated_at_fields'),
     ]
 
-    operations = [
-        migrations.AddField(
-            model_name='purchaseorderitem',
-            name='received_quantity',
-            field=models.PositiveIntegerField(default=0),
-        ),
-    ]
+    operations = []

@@ -1,7 +1,7 @@
 from django.contrib.auth.models import Group, User
 from rest_framework import serializers
 
-from .models import TopBarPermission, UserProfile, default_topbar_permissions
+from .models import TopBarPermission, UserAuditLog, UserProfile, default_topbar_permissions
 
 
 class GroupSerializer(serializers.ModelSerializer):
@@ -50,6 +50,15 @@ class TopBarPermissionSerializer(serializers.ModelSerializer):
     class Meta:
         model = TopBarPermission
         fields = ['id', 'user_profile', 'username', 'role', 'allowed_buttons', 'updated_at']
+
+
+class UserAuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserAuditLog
+        fields = [
+            'id', 'user', 'user_profile', 'username', 'role', 'action', 'method',
+            'path', 'status_code', 'ip_address', 'user_agent', 'metadata', 'created_at'
+        ]
 
 
 class UserProfileSerializer(serializers.ModelSerializer):

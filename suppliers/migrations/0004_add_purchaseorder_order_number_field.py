@@ -24,10 +24,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AddField(
-            model_name='purchaseorder',
-            name='order_number',
-            field=models.CharField(blank=True, max_length=50),
-        ),
-        migrations.RunPython(populate_order_numbers),
+        migrations.RunPython(migrations.RunPython.noop, migrations.RunPython.noop),
     ]

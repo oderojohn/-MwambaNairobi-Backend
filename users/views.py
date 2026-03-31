@@ -9,8 +9,9 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import TopBarPermission, UserProfile, default_topbar_permissions
-from .serializers import GroupSerializer, TopBarPermissionSerializer, UserProfileSerializer
+from .audit import log_user_activity
+from .models import TopBarPermission, UserAuditLog, UserProfile, default_topbar_permissions
+from .serializers import GroupSerializer, TopBarPermissionSerializer, UserAuditLogSerializer, UserProfileSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,52 @@ class UserProfileViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return UserProfile.objects.select_related('user', 'branch').prefetch_related('user__groups').all()
+
+    def perform_create(self, serializer):
+        profile = serializer.save()
+        log_user_activity(
+            action='user_created',
+            user=self.request.user,
+            request=self.request,
+            status_code=status.HTTP_201_CREATED,
+            metadata={'created_user': profile.user.username, 'role': profile.role},
+        )
+
+    def perform_update(self, serializer):
+        profile = serializer.save()
+        log_user_activity(
+            action='user_updated',
+            user=self.request.user,
+            request=self.request,
+            status_code=status.HTTP_200_OK,
+            metadata={'updated_user': profile.user.username, 'role': profile.role},
+        )
+
+    def perform_destroy(self, instance):
+        username = instance.user.username
+        super().perform_destroy(instance)
+        log_user_activity(
+            action='user_deleted',
+            user=self.request.user,
+            request=self.request,
+            status_code=status.HTTP_204_NO_CONTENT,
+            metadata={'deleted_user': username},
+        )
+
+
+class UserAuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = UserAuditLogSerializer
+    permission_classes = [IsAdminOrManager]
+
+    def get_queryset(self):
+        queryset = UserAuditLog.objects.select_related('user', 'user_profile').all()
+        user_id = self.request.query_params.get('user')
+        action = self.request.query_params.get('action')
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        if action:
+            queryset = queryset.filter(action=action)
+        return queryset
 
 
 class TopBarPermissionViewSet(viewsets.ModelViewSet):
@@ -64,6 +111,16 @@ class TopBarPermissionViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(permission_obj)
         return Response(serializer.data)
 
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        log_user_activity(
+            action='permissions_updated',
+            user=self.request.user,
+            request=self.request,
+            status_code=status.HTTP_200_OK,
+            metadata={'target_user': instance.user_profile.user.username},
+        )
+
 
 class GroupListCreateView(APIView):
     permission_classes = [IsAdminOrManager]
@@ -74,7 +131,14 @@ class GroupListCreateView(APIView):
     def post(self, request):
         serializer = GroupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        group = serializer.save()
+        log_user_activity(
+            action='group_created',
+            user=request.user,
+            request=request,
+            status_code=status.HTTP_201_CREATED,
+            metadata={'group': group.name},
+        )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -89,7 +153,14 @@ class GroupDetailView(APIView):
 
         serializer = GroupSerializer(group, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        group = serializer.save()
+        log_user_activity(
+            action='group_updated',
+            user=request.user,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata={'group': group.name},
+        )
         return Response(serializer.data)
 
     def delete(self, request, pk):
@@ -97,8 +168,15 @@ class GroupDetailView(APIView):
             group = Group.objects.get(pk=pk)
         except Group.DoesNotExist:
             return Response({'error': 'Group not found'}, status=status.HTTP_404_NOT_FOUND)
-
+        group_name = group.name
         group.delete()
+        log_user_activity(
+            action='group_deleted',
+            user=request.user,
+            request=request,
+            status_code=status.HTTP_204_NO_CONTENT,
+            metadata={'group': group_name},
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -121,6 +199,19 @@ class LoginView(TokenObtainPairView):
 
             if user:
                 response = self.add_user_data(response, user)
+                log_user_activity(
+                    action='login',
+                    user=user,
+                    request=request,
+                    status_code=response.status_code,
+                )
+            else:
+                log_user_activity(
+                    action='login_failed',
+                    request=request,
+                    status_code=response.status_code,
+                    username=username or '',
+                )
 
         return response
 
@@ -132,6 +223,13 @@ class LoginView(TokenObtainPairView):
             return Response({"error": "Invalid PIN"}, status=status.HTTP_400_BAD_REQUEST)
 
         if not user.is_active:
+            log_user_activity(
+                action='login_failed',
+                request=request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                username=getattr(user, 'username', ''),
+                metadata={'reason': 'inactive_user'},
+            )
             return Response({"error": "User account is disabled"}, status=status.HTTP_400_BAD_REQUEST)
 
         refresh = RefreshToken.for_user(user)
@@ -140,7 +238,14 @@ class LoginView(TokenObtainPairView):
             "refresh": str(refresh),
         }, status=status.HTTP_200_OK)
 
-        return self.add_user_data(response, user)
+        response = self.add_user_data(response, user)
+        log_user_activity(
+            action='login',
+            user=user,
+            request=request,
+            status_code=response.status_code,
+        )
+        return response
 
     def add_user_data(self, response, user):
         profile = getattr(user, 'userprofile', None)
@@ -217,6 +322,12 @@ class LogoutView(APIView):
         try:
             token = RefreshToken(refresh_token)
             token.blacklist()
+            log_user_activity(
+                action='logout',
+                user=request.user,
+                request=request,
+                status_code=status.HTTP_200_OK,
+            )
             logout(request)
             return Response({"message": "Successfully logged out"}, status=status.HTTP_200_OK)
         except Exception:

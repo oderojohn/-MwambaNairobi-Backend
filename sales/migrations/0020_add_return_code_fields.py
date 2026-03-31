@@ -24,46 +24,9 @@ class Migration(migrations.Migration):
                 'verbose_name_plural': 'Receipt Counters',
             },
         ),
-        migrations.RemoveField(
-            model_name='returncode',
-            name='return_record',
-        ),
-        migrations.RemoveField(
-            model_name='returncode',
-            name='used_in_sale',
-        ),
-        migrations.RemoveField(
-            model_name='returnitem',
-            name='return_record',
-        ),
-        migrations.RemoveField(
-            model_name='returnitem',
-            name='sale_item',
-        ),
-        migrations.RemoveField(
-            model_name='return',
-            name='new_items_total',
-        ),
-        migrations.RemoveField(
-            model_name='return',
-            name='payment_method',
-        ),
-        migrations.RemoveField(
-            model_name='return',
-            name='price_difference',
-        ),
         migrations.AlterField(
             model_name='return',
             name='total_refund_amount',
             field=models.DecimalField(decimal_places=2, max_digits=10),
-        ),
-        migrations.DeleteModel(
-            name='ExchangeItem',
-        ),
-        migrations.DeleteModel(
-            name='ReturnCode',
-        ),
-        migrations.DeleteModel(
-            name='ReturnItem',
         ),
     ]

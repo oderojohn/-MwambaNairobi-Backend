@@ -16,6 +16,7 @@ from shifts.models import Shift
 from payments.models import Payment
 from .services import sales_service, stock_service, payment_service, audit_service
 from .services.receipt_number_service import get_next_receipt_number, get_next_return_receipt_number
+from users.audit import log_user_activity
 
 class CartViewSet(viewsets.ModelViewSet):
     queryset = Cart.objects.all()
@@ -328,6 +329,13 @@ class SaleViewSet(viewsets.ModelViewSet):
 
         # Void the order
         sales_service.void_held_order(cart, void_reason, cashier)
+        log_user_activity(
+            action='held_order_voided',
+            user=request.user,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata={'cart_id': cart.id, 'void_reason': void_reason},
+        )
 
         return Response({
             'message': 'Held order voided successfully',
@@ -443,6 +451,19 @@ class SaleViewSet(viewsets.ModelViewSet):
 
             # Calculate new total (convert to float first)
             new_total = sum(float(item['unit_price']) * item['quantity'] for item in updated_items)
+            log_user_activity(
+                action='held_order_updated',
+                user=request.user,
+                request=request,
+                status_code=status.HTTP_200_OK,
+                metadata={
+                    'cart_id': cart.id,
+                    'items_added': len(items_to_add),
+                    'items_removed': len(items_to_remove),
+                    'quantities_updated': len(update_quantities),
+                    'total': str(new_total),
+                },
+            )
 
             return Response({
                 'message': 'Held order updated successfully',
@@ -1527,6 +1548,19 @@ class SaleViewSet(viewsets.ModelViewSet):
                     description=f'Complete transaction void by {request.user.userprofile.role}: {void_reason}',
                     request=request
                 )
+                log_user_activity(
+                    action='transaction_voided',
+                    user=request.user,
+                    request=request,
+                    status_code=status.HTTP_200_OK,
+                    metadata={
+                        'sale_id': sale.id,
+                        'receipt_number': sale.receipt_number,
+                        'void_reason': void_reason,
+                        'items_restocked': sale.saleitem_set.count(),
+                        'amount_refunded': str(sale.final_amount),
+                    },
+                )
 
                 return Response({
                     'message': 'Transaction voided successfully - all items restocked',
@@ -1639,6 +1673,17 @@ class SaleViewSet(viewsets.ModelViewSet):
                     # Save cart as hold order
                     cart.status = 'held'
                     cart.save(update_fields=['status'])
+                    log_user_activity(
+                        action='held_order_created',
+                        user=request.user,
+                        request=request,
+                        status_code=status.HTTP_201_CREATED,
+                        metadata={
+                            'cart_id': cart.id,
+                            'items_count': len(items_data),
+                            'customer_id': customer.id if customer else None,
+                        },
+                    )
                     
                     # Return success response for hold order
                     return Response(CartSerializer(cart).data, status=status.HTTP_201_CREATED)
@@ -1720,6 +1765,33 @@ class SaleViewSet(viewsets.ModelViewSet):
                     return Response(
                         {'error': str(e)},
                         status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                log_user_activity(
+                    action='sale_created',
+                    user=request.user,
+                    request=request,
+                    status_code=status.HTTP_201_CREATED,
+                    metadata={
+                        'sale_id': sale.id,
+                        'receipt_number': sale.receipt_number,
+                        'payment_method': payment_method,
+                        'total_amount': total_amount,
+                        'items_count': len(items_data),
+                    },
+                )
+                for payment in created_payments:
+                    log_user_activity(
+                        action='payment_created',
+                        user=request.user,
+                        request=request,
+                        status_code=status.HTTP_201_CREATED,
+                        metadata={
+                            'payment_id': payment.id,
+                            'sale_id': sale.id,
+                            'payment_type': payment.payment_type,
+                            'amount': str(payment.amount),
+                        },
                     )
 
                 # Serialize and return the sale
@@ -2028,6 +2100,21 @@ Use this code for future refunds
                         'total_refund': total_refund
                     },
                     request=request
+                )
+                log_user_activity(
+                    action='return_created',
+                    user=request.user,
+                    request=request,
+                    status_code=status.HTTP_201_CREATED,
+                    metadata={
+                        'return_id': return_record.id,
+                        'receipt_number': receipt_number,
+                        'original_sale_id': sale.id,
+                        'original_receipt_number': sale.receipt_number,
+                        'return_type': return_type,
+                        'total_refund': total_refund,
+                        'items_count': len(items_data),
+                    },
                 )
 
                 serializer = self.get_serializer(return_record)

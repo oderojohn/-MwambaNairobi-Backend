@@ -9,15 +9,4 @@ class Migration(migrations.Migration):
         ('suppliers', '0006_add_purchaseorder_notes_field'),
     ]
 
-    operations = [
-        migrations.AddField(
-            model_name='purchaseorder',
-            name='created_at',
-            field=models.DateTimeField(auto_now_add=True),
-        ),
-        migrations.AddField(
-            model_name='purchaseorder',
-            name='updated_at',
-            field=models.DateTimeField(auto_now=True),
-        ),
-    ]
+    operations = []

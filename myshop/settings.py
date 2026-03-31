@@ -20,7 +20,7 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in os.environ.get(
         'ALLOWED_HOSTS',
-        '.vercel.app,localhost,127.0.0.1,0.0.0.0,10.63.203.53'
+        '.vercel.app,localhost,127.0.0.1,0.0.0.0,10.63.203.53,lecture-routers-ace-regulation.trycloudflare.com'
     ).split(',')
     if host.strip()
 ]
@@ -69,6 +69,7 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'users.middleware.UserActivityAuditMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -94,21 +95,26 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'myshop.wsgi.application'
 
-# ✅ Database (SQLite for now, switchable to Postgres later)
+# ✅ Database
+# Local development uses SQLite by default.
+# Production/Vercel should provide DATABASE_URL (for example a Neon Postgres URL).
+database_url = os.environ.get('DATABASE_URL')
 
-# DATABASES = {
-#     'default': dj_database_url.parse(
-#         'postgresql://neondb_owner:npg_6zcA5DHaPqdL@ep-curly-dust-adhlqx3r-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
-#         conn_max_age=600,
-#         ssl_require=True
-#     )
-# }
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+if database_url:
+    DATABASES = {
+        'default': dj_database_url.parse(
+            database_url,
+            conn_max_age=600,
+            ssl_require=True,
+        )
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -179,6 +185,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3001",        # added
     "http://192.168.10.219:3001",   # added
     "https://mwambaliquor.netlify.app",  # added
+    "https://mwamba.netlify.app",
+    "https://lecture-routers-ace-regulation.trycloudflare.com",
     "http://192.168.0.110:3000"
 ]
 
@@ -192,6 +200,8 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:3001",
     "https://mwambaliquor.netlify.app",  # added
+    "https://mwamba.netlify.app",
+    "https://lecture-routers-ace-regulation.trycloudflare.com",
     "http://192.168.0.110:3000"
 ]
 

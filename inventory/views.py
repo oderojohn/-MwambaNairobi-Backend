@@ -22,6 +22,7 @@ from .serializers import CategorySerializer, ProductSerializer, BatchSerializer,
 from django.db.models import Q
 from django.utils import timezone
 from datetime import datetime, date
+from users.audit import log_user_activity
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -40,6 +41,102 @@ class ProductViewSet(viewsets.ModelViewSet):
     search_fields = ['sku', 'name', 'description']
     ordering_fields = ['name', 'created_at', 'selling_price']
     ordering = ['name']
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        if response.status_code == status.HTTP_201_CREATED and getattr(request.user, 'is_authenticated', False):
+            log_user_activity(
+                action='product_created',
+                user=request.user,
+                request=request,
+                status_code=response.status_code,
+                metadata={
+                    'product_id': response.data.get('id'),
+                    'name': response.data.get('name'),
+                    'sku': response.data.get('sku'),
+                    'selling_price': response.data.get('selling_price'),
+                    'cost_price': response.data.get('cost_price'),
+                },
+            )
+        return response
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        old_values = {
+            'name': instance.name,
+            'sku': instance.sku,
+            'cost_price': str(instance.cost_price),
+            'selling_price': str(instance.selling_price),
+            'wholesale_price': str(instance.wholesale_price) if instance.wholesale_price is not None else None,
+            'stock_quantity': instance.stock_quantity,
+            'is_active': instance.is_active,
+        }
+        response = super().update(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK and getattr(request.user, 'is_authenticated', False):
+            new_values = {
+                'name': response.data.get('name'),
+                'sku': response.data.get('sku'),
+                'cost_price': str(response.data.get('cost_price')),
+                'selling_price': str(response.data.get('selling_price')),
+                'wholesale_price': response.data.get('wholesale_price'),
+                'stock_quantity': response.data.get('stock_quantity'),
+                'is_active': response.data.get('is_active'),
+            }
+            changed_fields = {
+                key: {'old': old_values.get(key), 'new': new_values.get(key)}
+                for key in new_values
+                if old_values.get(key) != new_values.get(key)
+            }
+            if changed_fields:
+                log_user_activity(
+                    action='product_updated',
+                    user=request.user,
+                    request=request,
+                    status_code=response.status_code,
+                    metadata={
+                        'product_id': instance.id,
+                        'name': response.data.get('name'),
+                        'changed_fields': changed_fields,
+                    },
+                )
+                price_changes = {
+                    key: changed_fields[key]
+                    for key in ['cost_price', 'selling_price', 'wholesale_price']
+                    if key in changed_fields
+                }
+                if price_changes:
+                    log_user_activity(
+                        action='product_price_changed',
+                        user=request.user,
+                        request=request,
+                        status_code=response.status_code,
+                        metadata={
+                            'product_id': instance.id,
+                            'name': response.data.get('name'),
+                            'price_changes': price_changes,
+                        },
+                    )
+        return response
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        metadata = {
+            'product_id': instance.id,
+            'name': instance.name,
+            'sku': instance.sku,
+            'selling_price': str(instance.selling_price),
+            'cost_price': str(instance.cost_price),
+        }
+        response = super().destroy(request, *args, **kwargs)
+        if response.status_code == status.HTTP_204_NO_CONTENT and getattr(request.user, 'is_authenticated', False):
+            log_user_activity(
+                action='product_deleted',
+                user=request.user,
+                request=request,
+                status_code=response.status_code,
+                metadata=metadata,
+            )
+        return response
 
     @action(detail=False, methods=['get'])
     def pos_products(self, request):
@@ -72,6 +169,13 @@ class ProductViewSet(viewsets.ModelViewSet):
                 'difference': new_stock - old_stock
             })
         
+        log_user_activity(
+            action='stock_recalculated',
+            user=request.user if getattr(request.user, 'is_authenticated', False) else None,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata={'products_recalculated': len(results)},
+        )
         return Response({
             'message': f'Stock recalculated for {len(results)} products',
             'results': results
@@ -84,6 +188,13 @@ class ProductViewSet(viewsets.ModelViewSet):
         old_stock = product.stock_quantity
         new_stock = product.recalculate_stock_from_batches()
         
+        log_user_activity(
+            action='stock_recalculated',
+            user=request.user if getattr(request.user, 'is_authenticated', False) else None,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata={'product_id': product.id, 'product_name': product.name, 'old_stock': old_stock, 'new_stock': new_stock},
+        )
         return Response({
             'product_id': product.id,
             'product_name': product.name,
@@ -148,6 +259,18 @@ class BatchViewSet(viewsets.ModelViewSet):
         batch.receive_batch(actual_quantity)
 
         serializer = self.get_serializer(batch)
+        log_user_activity(
+            action='batch_received',
+            user=request.user if getattr(request.user, 'is_authenticated', False) else None,
+            request=request,
+            status_code=status.HTTP_200_OK,
+            metadata={
+                'batch_id': batch.id,
+                'batch_number': batch.batch_number,
+                'product_id': batch.product_id,
+                'received_quantity': actual_quantity,
+            },
+        )
         return Response({
             'message': f'Batch {batch.batch_number} received successfully',
             'batch': serializer.data,

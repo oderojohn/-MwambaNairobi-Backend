@@ -16,6 +16,19 @@ This backend is a Django + DRF POS system tailored for a small liquor shop with 
 
 Copy `.env.example` and adjust values as needed.
 
+### Vercel + Neon
+
+For Vercel deployment, set these project environment variables:
+
+```bash
+DEBUG=False
+SECRET_KEY=your-production-secret-key
+DATABASE_URL=postgresql://neondb_owner:npg_XE13DURrgaih@ep-empty-mud-amnh40nu-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+ALLOWED_HOSTS=.vercel.app,localhost,127.0.0.1,0.0.0.0,lecture-routers-ace-regulation.trycloudflare.com
+```
+
+After setting `DATABASE_URL`, run migrations against the deployed database.
+
 ## Seed Starter Data
 
 Use the small shop catalog seeder:

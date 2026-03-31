@@ -9,10 +9,4 @@ class Migration(migrations.Migration):
         ('suppliers', '0004_add_purchaseorder_order_number_field'),
     ]
 
-    operations = [
-        migrations.AddField(
-            model_name='purchaseorder',
-            name='expected_delivery_date',
-            field=models.DateField(blank=True, null=True),
-        ),
-    ]
+    operations = []

@@ -10,10 +10,4 @@ class Migration(migrations.Migration):
         ('inventory', '0012_merge_20251025_1754'),
     ]
 
-    operations = [
-        migrations.AddField(
-            model_name='batch',
-            name='product',
-            field=models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to='inventory.product'),
-        ),
-    ]
+    operations = []

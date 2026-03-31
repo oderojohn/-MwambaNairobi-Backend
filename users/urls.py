@@ -5,6 +5,7 @@ from . import views
 router = DefaultRouter()
 router.register(r'', views.UserProfileViewSet, basename='user')
 router.register(r'topbar-permissions', views.TopBarPermissionViewSet, basename='topbar-permissions')
+router.register(r'audit-logs', views.UserAuditLogViewSet, basename='audit-logs')
 
 urlpatterns = [
     path('login/', views.LoginView.as_view(), name='login'),

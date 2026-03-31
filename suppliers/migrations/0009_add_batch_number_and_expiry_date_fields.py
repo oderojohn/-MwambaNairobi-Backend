@@ -9,15 +9,4 @@ class Migration(migrations.Migration):
         ('suppliers', '0008_add_received_quantity_field'),
     ]
 
-    operations = [
-        migrations.AddField(
-            model_name='purchaseorderitem',
-            name='batch_number',
-            field=models.CharField(blank=True, max_length=50),
-        ),
-        migrations.AddField(
-            model_name='purchaseorderitem',
-            name='expiry_date',
-            field=models.DateField(blank=True, null=True),
-        ),
-    ]
+    operations = []
